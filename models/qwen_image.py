@@ -293,16 +293,27 @@ class QwenImagePipeline(BasePipeline):
         with init_empty_weights():
             transformer = diffusers.QwenImageTransformer2DModel.from_config(json_config)
 
-        for key, tensor in iterate_safetensors(transformer_path):
-            dtype_to_use = (
-                dtype
-                if any(keyword in key for keyword in KEEP_IN_HIGH_PRECISION)
-                or tensor.ndim == 1
-                else transformer_dtype
+        try:
+            for key, tensor in iterate_safetensors(transformer_path):
+                dtype_to_use = (
+                    dtype
+                    if any(keyword in key for keyword in KEEP_IN_HIGH_PRECISION)
+                    or tensor.ndim == 1
+                    else transformer_dtype
+                )
+                set_module_tensor_to_device(
+                    transformer, key, device="cpu", dtype=dtype_to_use, value=tensor
+                )
+        except Exception as e:
+            # MISW BEGIN
+            print(f"[Warning] got {e} while loading transformer, try another way ...")
+            transformer = diffusers.QwenImageTransformer2DModel.from_single_file(
+                transformer_path,
+                config="Qwen/Qwen-Image",
+                subfolder="transformer",
+                torch_dtype=transformer_dtype,
             )
-            set_module_tensor_to_device(
-                transformer, key, device="cpu", dtype=dtype_to_use, value=tensor
-            )
+            # MISW END
 
         attn_processor = QwenDoubleStreamAttnProcessor2_0()
         for block in transformer.transformer_blocks:
