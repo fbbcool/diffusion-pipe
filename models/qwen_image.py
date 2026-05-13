@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 from typing import Union, Tuple, Optional
 import math
@@ -10,13 +11,14 @@ import diffusers
 from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.attention_processor import Attention
 import safetensors
+import safetensors.torch
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 import transformers
 from PIL import Image, ImageOps
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
-from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, iterate_safetensors
+from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, iterate_safetensors, is_main_process
 from utils.offloading import ModelOffloader
 
 
@@ -255,12 +257,96 @@ class QwenImagePipeline(BasePipeline):
         with open('configs/qwen_image/transformer/config.json') as f:
             json_config = json.load(f)
 
+        # Optional: aggregate `merge_adapters` LoRA deltas. Computed in fp32 once
+        # and applied to each base tensor (in fp32) BEFORE the configured
+        # transformer_dtype cast, so the merge math is at high precision. Note
+        # that when transformer_dtype is a low-precision format like float8_e4m3,
+        # the per-weight quantization step at typical attention-weight magnitudes
+        # may exceed small LoRA delta magnitudes — for small/early-training LoRAs
+        # the merged effect can be largely erased by the post-merge cast. For
+        # full fidelity, set transformer_dtype='bfloat16' or accept the loss.
+        merge_deltas: dict[str, torch.Tensor] = {}
+        for adapter_path in self.model_config.get('merge_adapters', []):
+            adapter_file = Path(adapter_path)
+            if adapter_file.is_dir():
+                files = list(adapter_file.glob('*.safetensors'))
+                if len(files) != 1:
+                    raise RuntimeError(
+                        f'merge_adapters path {adapter_path} must be a single .safetensors file '
+                        f'or a directory containing exactly one (found {len(files)})'
+                    )
+                adapter_file = files[0]
+
+            # Read optional adapter_config.json from the adapter dir for alpha/rank.
+            # PEFT/diffusion-pipe default is alpha=rank → scale=1.0; fall back to that.
+            cfg_path = adapter_file.parent / 'adapter_config.json'
+            scale = 1.0
+            if cfg_path.exists():
+                try:
+                    with open(cfg_path) as f:
+                        cfg = json.load(f)
+                    alpha = float(cfg.get('lora_alpha', 1))
+                    rank = float(cfg.get('r', 1))
+                    if rank > 0:
+                        scale = alpha / rank
+                except Exception as exc:
+                    if is_main_process():
+                        print(f'[merge_adapters] could not parse {cfg_path}: {exc}; using scale=1.0')
+
+            if is_main_process():
+                print(f'[merge_adapters] loading {adapter_file} (scale={scale})')
+
+            adapter_sd = safetensors.torch.load_file(str(adapter_file))
+            n_pairs = 0
+            for a_key, A in adapter_sd.items():
+                if not a_key.endswith('.lora_A.weight'):
+                    continue
+                b_key = a_key[: -len('.lora_A.weight')] + '.lora_B.weight'
+                if b_key not in adapter_sd:
+                    continue
+                B = adapter_sd[b_key]
+                # Normalize to base-key: strip 'transformer.' / 'diffusion_model.' prefix
+                # and drop the '.lora_A' segment.
+                stem = re.sub(r'^(transformer|diffusion_model)\.', '', a_key)
+                stem = stem[: -len('.lora_A.weight')]
+                base_key = stem + '.weight'
+                delta = (B.to(torch.float32) @ A.to(torch.float32)) * scale
+                if base_key in merge_deltas:
+                    merge_deltas[base_key] = merge_deltas[base_key] + delta
+                else:
+                    merge_deltas[base_key] = delta
+                n_pairs += 1
+            del adapter_sd
+            if is_main_process():
+                print(f'[merge_adapters] {adapter_file}: prepared {n_pairs} pairs')
+
+        if merge_deltas and is_main_process():
+            print(f'[merge_adapters] total unique base keys with delta: {len(merge_deltas)}')
+
         with init_empty_weights():
             transformer = diffusers.QwenImageTransformer2DModel.from_config(json_config)
 
+        n_merged = 0
         for key, tensor in iterate_safetensors(transformer_path):
             dtype_to_use = dtype if any(keyword in key for keyword in KEEP_IN_HIGH_PRECISION) or tensor.ndim == 1 else transformer_dtype
+            if key in merge_deltas:
+                # Merge in fp32 before the dtype cast for cleanest precision.
+                tensor = (tensor.to(torch.float32) + merge_deltas[key]).to(tensor.dtype)
+                del merge_deltas[key]
+                n_merged += 1
             set_module_tensor_to_device(transformer, key, device='cpu', dtype=dtype_to_use, value=tensor)
+
+        if merge_deltas:
+            # Any leftover deltas mean LoRA keys that don't exist in the base.
+            # Warn but don't fail — the user might have a renamed/extended adapter.
+            if is_main_process():
+                print(
+                    f'[merge_adapters] {len(merge_deltas)} adapter deltas had no '
+                    f'matching base key (skipped). Sample: '
+                    f'{list(merge_deltas.keys())[:3]}'
+                )
+        elif n_merged and is_main_process():
+            print(f'[merge_adapters] merged {n_merged} adapter deltas into base')
 
         attn_processor = QwenDoubleStreamAttnProcessor2_0()
         for block in transformer.transformer_blocks:
