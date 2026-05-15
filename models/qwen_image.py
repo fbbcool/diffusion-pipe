@@ -276,15 +276,33 @@ class QwenImagePipeline(BasePipeline):
         # by the post-merge cast. For full fidelity, set
         # transformer_dtype='bfloat16' or accept the loss.
 
-        # base_key -> list[(scale, A, B)]. A and B are CPU tensors held in
-        # the adapter state-dicts; PyTorch refcounting keeps them alive as
-        # long as merge_index references them.
+        # base_key -> list[(effective_scale, A, B)]. A and B are CPU tensors
+        # held in the adapter state-dicts; PyTorch refcounting keeps them
+        # alive as long as merge_index references them.
         merge_index: dict[str, list[tuple[float, torch.Tensor, torch.Tensor]]] = {}
         # Keep the underlying state-dicts pinned via a list so we can free
         # them all in one drop after the merge loop.
         _adapter_sd_keepalive: list[dict] = []
         n_pairs_total = 0
-        for adapter_path in self.model_config.get('merge_adapters', []):
+        # Each entry in merge_adapters is either:
+        #   - a string path: full-strength merge (weight=1.0)
+        #   - a dict {path, weight}: user-specified strength multiplier
+        # Dict-form `weight` is multiplied into the per-pair scale, giving
+        # train-test parity when the child LoRA will be stacked on top of
+        # this adapter at the same strength at inference (e.g. xlasm child
+        # LoRAs trained against an xlasm@0.8 base because inference stacks
+        # xlasm10 at 0.8).
+        for entry in self.model_config.get('merge_adapters', []):
+            if isinstance(entry, dict):
+                adapter_path = entry.get('path')
+                if not adapter_path:
+                    raise RuntimeError(
+                        f"merge_adapters dict entry missing 'path' key: {entry}"
+                    )
+                user_weight = float(entry.get('weight', 1.0))
+            else:
+                adapter_path = entry
+                user_weight = 1.0
             adapter_file = Path(adapter_path)
             if adapter_file.is_dir():
                 files = list(adapter_file.glob('*.safetensors'))
@@ -311,8 +329,16 @@ class QwenImagePipeline(BasePipeline):
                     if is_main_process():
                         print(f'[merge_adapters] could not parse {cfg_path}: {exc}; using scale=1.0')
 
+            effective_scale = scale * user_weight
+
             if is_main_process():
-                print(f'[merge_adapters] indexing {adapter_file} (scale={scale})')
+                if user_weight != 1.0:
+                    print(
+                        f'[merge_adapters] indexing {adapter_file} '
+                        f'(scale={scale}, weight={user_weight}, effective={effective_scale})'
+                    )
+                else:
+                    print(f'[merge_adapters] indexing {adapter_file} (scale={scale})')
 
             adapter_sd = safetensors.torch.load_file(str(adapter_file))
             _adapter_sd_keepalive.append(adapter_sd)
@@ -329,7 +355,7 @@ class QwenImagePipeline(BasePipeline):
                 stem = re.sub(r'^(transformer|diffusion_model)\.', '', a_key)
                 stem = stem[: -len('.lora_A.weight')]
                 base_key = stem + '.weight'
-                merge_index.setdefault(base_key, []).append((scale, A, B))
+                merge_index.setdefault(base_key, []).append((effective_scale, A, B))
                 n_pairs += 1
             if is_main_process():
                 print(f'[merge_adapters] {adapter_file}: indexed {n_pairs} pairs')
