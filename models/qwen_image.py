@@ -285,13 +285,24 @@ class QwenImagePipeline(BasePipeline):
         _adapter_sd_keepalive: list[dict] = []
         n_pairs_total = 0
         # Each entry in merge_adapters is either:
-        #   - a string path: full-strength merge (weight=1.0)
+        #   - a string path: hard-wired weight (see DEFAULT_MERGE_WEIGHT below)
         #   - a dict {path, weight}: user-specified strength multiplier
         # Dict-form `weight` is multiplied into the per-pair scale, giving
         # train-test parity when the child LoRA will be stacked on top of
         # this adapter at the same strength at inference (e.g. xlasm child
         # LoRAs trained against an xlasm@0.8 base because inference stacks
         # xlasm10 at 0.8).
+        #
+        # TEMPORARY HARD-WIRE: the default weight is 0.8 (not 1.0) because
+        # current xlasm child-LoRA inference stacks xlasm10 at 0.8, and the
+        # Templater layer (ainstall.py: model___merge_adapters / list_str)
+        # cannot yet express dict-form entries with explicit weights. Until
+        # that plumbing lands, every merge_adapters entry rendered via the
+        # Templater (always single-LoRA, always string form) gets weight 0.8.
+        # When the Templater supports {path, weight} dicts, revert this
+        # default to 1.0 and pass weight=0.8 explicitly from the trainer
+        # config.
+        DEFAULT_MERGE_WEIGHT = 0.8
         for entry in self.model_config.get('merge_adapters', []):
             if isinstance(entry, dict):
                 adapter_path = entry.get('path')
@@ -299,10 +310,10 @@ class QwenImagePipeline(BasePipeline):
                     raise RuntimeError(
                         f"merge_adapters dict entry missing 'path' key: {entry}"
                     )
-                user_weight = float(entry.get('weight', 1.0))
+                user_weight = float(entry.get('weight', DEFAULT_MERGE_WEIGHT))
             else:
                 adapter_path = entry
-                user_weight = 1.0
+                user_weight = DEFAULT_MERGE_WEIGHT
             adapter_file = Path(adapter_path)
             if adapter_file.is_dir():
                 files = list(adapter_file.glob('*.safetensors'))
