@@ -257,15 +257,33 @@ class QwenImagePipeline(BasePipeline):
         with open('configs/qwen_image/transformer/config.json') as f:
             json_config = json.load(f)
 
-        # Optional: aggregate `merge_adapters` LoRA deltas. Computed in fp32 once
-        # and applied to each base tensor (in fp32) BEFORE the configured
-        # transformer_dtype cast, so the merge math is at high precision. Note
-        # that when transformer_dtype is a low-precision format like float8_e4m3,
-        # the per-weight quantization step at typical attention-weight magnitudes
-        # may exceed small LoRA delta magnitudes — for small/early-training LoRAs
-        # the merged effect can be largely erased by the post-merge cast. For
-        # full fidelity, set transformer_dtype='bfloat16' or accept the loss.
-        merge_deltas: dict[str, torch.Tensor] = {}
+        # Optional: apply `merge_adapters` LoRA deltas to the base transformer
+        # weights during the streaming load. The base is iterated tensor-by-
+        # tensor via `iterate_safetensors`; each delta is computed lazily when
+        # its base key is encountered, applied in fp32, and discarded. This
+        # avoids holding the union of (B @ A) products resident — a ~37 GB
+        # cost on Qwen-Image 20B at rank 32 that previously OOMed boxes with
+        # <96 GB host RAM.
+        #
+        # Peak host RAM during merge ≈ base footprint on CPU + per-adapter
+        # raw lora_A/lora_B matrices (~80 MB at rank 32) + per-tensor fp32
+        # intermediate (~200 MB for the largest MLP projection).
+        #
+        # Note that when transformer_dtype is a low-precision format like
+        # float8_e4m3, the per-weight quantization step at typical attention-
+        # weight magnitudes may exceed small LoRA delta magnitudes — for
+        # small/early-training LoRAs the merged effect can be largely erased
+        # by the post-merge cast. For full fidelity, set
+        # transformer_dtype='bfloat16' or accept the loss.
+
+        # base_key -> list[(scale, A, B)]. A and B are CPU tensors held in
+        # the adapter state-dicts; PyTorch refcounting keeps them alive as
+        # long as merge_index references them.
+        merge_index: dict[str, list[tuple[float, torch.Tensor, torch.Tensor]]] = {}
+        # Keep the underlying state-dicts pinned via a list so we can free
+        # them all in one drop after the merge loop.
+        _adapter_sd_keepalive: list[dict] = []
+        n_pairs_total = 0
         for adapter_path in self.model_config.get('merge_adapters', []):
             adapter_file = Path(adapter_path)
             if adapter_file.is_dir():
@@ -294,9 +312,10 @@ class QwenImagePipeline(BasePipeline):
                         print(f'[merge_adapters] could not parse {cfg_path}: {exc}; using scale=1.0')
 
             if is_main_process():
-                print(f'[merge_adapters] loading {adapter_file} (scale={scale})')
+                print(f'[merge_adapters] indexing {adapter_file} (scale={scale})')
 
             adapter_sd = safetensors.torch.load_file(str(adapter_file))
+            _adapter_sd_keepalive.append(adapter_sd)
             n_pairs = 0
             for a_key, A in adapter_sd.items():
                 if not a_key.endswith('.lora_A.weight'):
@@ -310,43 +329,51 @@ class QwenImagePipeline(BasePipeline):
                 stem = re.sub(r'^(transformer|diffusion_model)\.', '', a_key)
                 stem = stem[: -len('.lora_A.weight')]
                 base_key = stem + '.weight'
-                delta = (B.to(torch.float32) @ A.to(torch.float32)) * scale
-                if base_key in merge_deltas:
-                    merge_deltas[base_key] = merge_deltas[base_key] + delta
-                else:
-                    merge_deltas[base_key] = delta
+                merge_index.setdefault(base_key, []).append((scale, A, B))
                 n_pairs += 1
-            del adapter_sd
             if is_main_process():
-                print(f'[merge_adapters] {adapter_file}: prepared {n_pairs} pairs')
+                print(f'[merge_adapters] {adapter_file}: indexed {n_pairs} pairs')
+            n_pairs_total += n_pairs
 
-        if merge_deltas and is_main_process():
-            print(f'[merge_adapters] total unique base keys with delta: {len(merge_deltas)}')
+        if merge_index and is_main_process():
+            print(f'[merge_adapters] total unique base keys with delta: {len(merge_index)} '
+                  f'(from {n_pairs_total} pairs across {len(_adapter_sd_keepalive)} adapter(s))')
 
         with init_empty_weights():
             transformer = diffusers.QwenImageTransformer2DModel.from_config(json_config)
 
+        consumed_keys: set[str] = set()
         n_merged = 0
         for key, tensor in iterate_safetensors(transformer_path):
             dtype_to_use = dtype if any(keyword in key for keyword in KEEP_IN_HIGH_PRECISION) or tensor.ndim == 1 else transformer_dtype
-            if key in merge_deltas:
-                # Merge in fp32 before the dtype cast for cleanest precision.
-                tensor = (tensor.to(torch.float32) + merge_deltas[key]).to(tensor.dtype)
-                del merge_deltas[key]
+            pairs = merge_index.get(key)
+            if pairs:
+                # Compute and apply deltas in fp32 before the dtype cast for
+                # cleanest precision. The fp32 buffer is allocated, summed
+                # in-place, cast, and freed per base tensor.
+                base_fp32 = tensor.to(torch.float32)
+                for scale, A, B in pairs:
+                    base_fp32.add_((B.to(torch.float32) @ A.to(torch.float32)) * scale)
+                tensor = base_fp32.to(tensor.dtype)
+                del base_fp32
+                consumed_keys.add(key)
                 n_merged += 1
             set_module_tensor_to_device(transformer, key, device='cpu', dtype=dtype_to_use, value=tensor)
 
-        if merge_deltas:
-            # Any leftover deltas mean LoRA keys that don't exist in the base.
+        # Drop adapter state-dicts now that the merge is done.
+        _adapter_sd_keepalive.clear()
+        leftover = [k for k in merge_index if k not in consumed_keys]
+        if leftover:
+            # Any leftover entries mean LoRA keys that don't exist in the base.
             # Warn but don't fail — the user might have a renamed/extended adapter.
             if is_main_process():
                 print(
-                    f'[merge_adapters] {len(merge_deltas)} adapter deltas had no '
-                    f'matching base key (skipped). Sample: '
-                    f'{list(merge_deltas.keys())[:3]}'
+                    f'[merge_adapters] {len(leftover)} adapter deltas had no '
+                    f'matching base key (skipped). Sample: {leftover[:3]}'
                 )
         elif n_merged and is_main_process():
-            print(f'[merge_adapters] merged {n_merged} adapter deltas into base')
+            print(f'[merge_adapters] merged {n_merged} adapter deltas into base (streaming)')
+        merge_index.clear()
 
         attn_processor = QwenDoubleStreamAttnProcessor2_0()
         for block in transformer.transformer_blocks:
