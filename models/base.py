@@ -390,7 +390,18 @@ class BasePipeline:
             # so they all contribute to the forward pass. PEFT applies
             # their deltas in parallel within each LoraLayer.
             active = ['default'] + [n for n, _ in runtime_specs]
-            self.lora_model.set_adapter(active)
+            # PeftModel.set_adapter rejects lists on many PEFT versions
+            # (`TypeError: unhashable type: 'list'` from a `name in dict`
+            # check inside PeftModel.set_adapter). Bypass it and call
+            # set_adapter on each tuner layer directly — every LoraLayer's
+            # set_adapter accepts a list and activates all listed adapters
+            # simultaneously. This is also what the tuner-level
+            # LoraModel.set_adapter wrapper does internally, just with
+            # stricter validation upstream.
+            from peft.tuners.tuners_utils import BaseTunerLayer
+            for module in self.lora_model.modules():
+                if isinstance(module, BaseTunerLayer):
+                    module.set_adapter(active)
 
             # Freeze runtime adapter parameters. PEFT's set_adapter may
             # re-enable gradients on active adapters in some versions, so
