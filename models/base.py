@@ -206,6 +206,134 @@ class BasePipeline:
             if p.requires_grad:
                 p.data = p.data.to(adapter_config['dtype'])
 
+        # ---- runtime_adapters ---------------------------------------------
+        # Load additional LoRAs that contribute to the forward pass but are
+        # NOT trained or saved with this run. Use case: train a new LoRA
+        # whose effective base includes one or more existing LoRAs at their
+        # inference strengths, so the trained LoRA learns a delta that
+        # COEXISTS with them rather than one that erodes them in pursuit of
+        # the dataset distribution.
+        #
+        # Contrast with `merge_adapters` (qwen_image.py): that path bakes
+        # adapter deltas into base weights at load. The trained LoRA then
+        # has full freedom to undo those merged contributions because they
+        # are inside its trainable parameter space. `runtime_adapters` keeps
+        # the existing adapters STRUCTURALLY OUTSIDE the trainable space.
+        #
+        # Each entry is a dict:
+        #   path:    directory with adapter_config.json + adapter_model.safetensors
+        #            (or path to the .safetensors file inside such a directory)
+        #   name:    optional adapter name (default: directory basename)
+        #   weight:  optional float strength multiplier (default: 1.0)
+        #
+        # Example TOML:
+        #   [[adapter.runtime_adapters]]
+        #   path   = '/path/to/xlasm10/'
+        #   weight = 0.8
+        runtime_entries = adapter_config.get('runtime_adapters', []) or []
+        runtime_specs: list[tuple[str, float]] = []
+        for entry in runtime_entries:
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    'runtime_adapters entry must be a dict with keys '
+                    f'{{path, name?, weight?}}, got: {entry!r}'
+                )
+            raw_path = entry.get('path')
+            if not raw_path:
+                raise RuntimeError(
+                    f"runtime_adapters entry missing 'path' key: {entry!r}"
+                )
+            adapter_path = Path(raw_path)
+            if adapter_path.is_file():
+                adapter_dir = adapter_path.parent
+            elif adapter_path.is_dir():
+                adapter_dir = adapter_path
+            else:
+                raise RuntimeError(
+                    f'runtime_adapters path does not exist: {raw_path}'
+                )
+            if not (adapter_dir / 'adapter_config.json').exists():
+                raise RuntimeError(
+                    f'runtime_adapters path {adapter_dir} is missing '
+                    'adapter_config.json (PEFT requires the adapter '
+                    'directory layout)'
+                )
+            adapter_name = entry.get('name') or adapter_dir.name
+            if adapter_name == 'default':
+                raise RuntimeError(
+                    "runtime_adapters entry name 'default' conflicts with "
+                    'the trainable adapter; choose a different name'
+                )
+            weight = float(entry.get('weight', 1.0))
+
+            if is_main_process():
+                print(
+                    f'[runtime_adapters] loading {adapter_dir} as frozen '
+                    f'adapter "{adapter_name}" (weight={weight})'
+                )
+            self.lora_model.load_adapter(str(adapter_dir), adapter_name=adapter_name)
+            runtime_specs.append((adapter_name, weight))
+
+        if runtime_specs:
+            # Activate trainable 'default' alongside all runtime adapters
+            # so they all contribute to the forward pass. PEFT applies
+            # their deltas in parallel within each LoraLayer.
+            active = ['default'] + [n for n, _ in runtime_specs]
+            self.lora_model.set_adapter(active)
+
+            # Freeze runtime adapter parameters. PEFT's set_adapter may
+            # re-enable gradients on active adapters in some versions, so
+            # we freeze AFTER set_adapter to guarantee the final state.
+            # Both the saver (utils/saver.py) and DeepSpeed gradient
+            # collection gate on requires_grad, so this is the single
+            # switch that excludes them from training.
+            n_frozen_total = 0
+            for adapter_name, _ in runtime_specs:
+                n_frozen = 0
+                key_a = f'.{adapter_name}.weight'
+                key_b = f'.{adapter_name}.bias'
+                for pname, p in self.lora_model.named_parameters():
+                    if key_a in pname or key_b in pname:
+                        p.requires_grad = False
+                        # Cast to trainable adapter's dtype for compute
+                        # uniformity; PEFT defaults loaded adapters to
+                        # fp32, which mismatches the bf16 forward pass.
+                        p.data = p.data.to(adapter_config['dtype'])
+                        n_frozen += 1
+                n_frozen_total += n_frozen
+
+            # Apply per-adapter strength. PEFT's per-adapter scaling lives
+            # on each LoraLayer instance as a dict; multiplying it by the
+            # user weight is the most version-portable handle (the
+            # set_scale / set_adapter_scale helpers have come and gone
+            # across PEFT releases).
+            for module in self.lora_model.modules():
+                scaling = getattr(module, 'scaling', None)
+                if not isinstance(scaling, dict):
+                    continue
+                for adapter_name, weight in runtime_specs:
+                    if adapter_name in scaling and weight != 1.0:
+                        scaling[adapter_name] = scaling[adapter_name] * weight
+
+            # Defensive: ensure every parameter has `original_name` set
+            # (the saver relies on it for any param that ever flips to
+            # requires_grad=True; runtime params don't, but future code
+            # might walk all params).
+            for name, p in self.transformer.named_parameters():
+                if not hasattr(p, 'original_name'):
+                    p.original_name = name
+
+            if is_main_process():
+                print(
+                    f'[runtime_adapters] active adapter list: {active} '
+                    f'(froze {n_frozen_total} runtime params across '
+                    f'{len(runtime_specs)} adapter(s))'
+                )
+                # Re-print trainable count so the user sees that the
+                # frozen adapters did NOT bump the trainable parameter
+                # tally.
+                self.lora_model.print_trainable_parameters()
+
     def save_adapter(self, save_dir, peft_state_dict):
         raise NotImplementedError()
 
