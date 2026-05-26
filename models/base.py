@@ -221,14 +221,18 @@ class BasePipeline:
         # the existing adapters STRUCTURALLY OUTSIDE the trainable space.
         #
         # Each entry is a dict:
-        #   path:    directory with adapter_config.json + adapter_model.safetensors
-        #            (or path to the .safetensors file inside such a directory)
-        #   name:    optional adapter name (default: directory basename)
+        #   path:    either a PEFT-style adapter directory (adapter_config.json
+        #            + adapter_model.safetensors) OR a single .safetensors file
+        #            in ComfyUI/inference format, OR a directory containing one
+        #            such .safetensors. The latter two cases derive rank/alpha
+        #            from the tensors directly (matches `merge_adapters`
+        #            behavior in qwen_image.py).
+        #   name:    optional adapter name (default: file/dir basename)
         #   weight:  optional float strength multiplier (default: 1.0)
         #
         # Example TOML:
         #   [[adapter.runtime_adapters]]
-        #   path   = '/path/to/xlasm10/'
+        #   path   = '/path/to/xlasm10.safetensors'
         #   weight = 0.8
         runtime_entries = adapter_config.get('runtime_adapters', []) or []
         runtime_specs: list[tuple[str, float]] = []
@@ -246,19 +250,17 @@ class BasePipeline:
             adapter_path = Path(raw_path)
             if adapter_path.is_file():
                 adapter_dir = adapter_path.parent
+                explicit_file = adapter_path
             elif adapter_path.is_dir():
                 adapter_dir = adapter_path
+                explicit_file = None
             else:
                 raise RuntimeError(
                     f'runtime_adapters path does not exist: {raw_path}'
                 )
-            if not (adapter_dir / 'adapter_config.json').exists():
-                raise RuntimeError(
-                    f'runtime_adapters path {adapter_dir} is missing '
-                    'adapter_config.json (PEFT requires the adapter '
-                    'directory layout)'
-                )
-            adapter_name = entry.get('name') or adapter_dir.name
+            adapter_name = entry.get('name') or (
+                adapter_path.stem if explicit_file else adapter_dir.name
+            )
             if adapter_name == 'default':
                 raise RuntimeError(
                     "runtime_adapters entry name 'default' conflicts with "
@@ -266,12 +268,121 @@ class BasePipeline:
                 )
             weight = float(entry.get('weight', 1.0))
 
-            if is_main_process():
-                print(
-                    f'[runtime_adapters] loading {adapter_dir} as frozen '
-                    f'adapter "{adapter_name}" (weight={weight})'
+            has_peft_config = (adapter_dir / 'adapter_config.json').exists()
+            if has_peft_config:
+                # PEFT directory layout (e.g. produced by diffusion-pipe's
+                # own save_adapter). PEFT reads the config, applies the
+                # saved target_modules, and loads the safetensors.
+                if is_main_process():
+                    print(
+                        f'[runtime_adapters] loading {adapter_dir} as frozen '
+                        f'adapter "{adapter_name}" (weight={weight}, PEFT-dir)'
+                    )
+                self.lora_model.load_adapter(
+                    str(adapter_dir), adapter_name=adapter_name
                 )
-            self.lora_model.load_adapter(str(adapter_dir), adapter_name=adapter_name)
+            else:
+                # ComfyUI / inference single-file format: no adapter_config.json.
+                # Locate the .safetensors, derive rank from key shapes, build a
+                # synthetic LoraConfig matching the trainable adapter's target
+                # modules, and load weights with manual key remapping.
+                if explicit_file is not None:
+                    sft_file = explicit_file
+                else:
+                    sft_files = list(adapter_dir.glob('*.safetensors'))
+                    if len(sft_files) != 1:
+                        raise RuntimeError(
+                            f'runtime_adapters dir {adapter_dir} has no '
+                            'adapter_config.json and must contain exactly one '
+                            f'.safetensors file (found {len(sft_files)})'
+                        )
+                    sft_file = sft_files[0]
+
+                sd = safetensors.torch.load_file(str(sft_file))
+                # Strip prefix to match base parameter naming (same regex
+                # convention as load_adapter_weights and merge_adapters).
+                normalized = {}
+                a_ranks: list[int] = []
+                for k, v in sd.items():
+                    k2 = re.sub(r'^(transformer|diffusion_model)\.', '', k)
+                    normalized[k2] = v
+                    if k2.endswith('.lora_A.weight'):
+                        a_ranks.append(v.shape[0])
+                if not a_ranks:
+                    raise RuntimeError(
+                        f'runtime_adapters file {sft_file} has no '
+                        "'lora_A.weight' tensors — not a recognizable LoRA"
+                    )
+                # Common case: all lora_A tensors share rank. If they don't
+                # (rare), use the max — PEFT will allocate that many rank
+                # slots; smaller lora_A tensors are padded by load_state_dict
+                # (no, actually strict=False just skips them — pre-warn).
+                rank = a_ranks[0]
+                if any(r != rank for r in a_ranks):
+                    if is_main_process():
+                        print(
+                            '[runtime_adapters] WARN: non-uniform rank in '
+                            f'{sft_file} (ranks={sorted(set(a_ranks))}); '
+                            f'using rank={rank}. Modules with a different '
+                            'rank will fall back to PEFT init (zero contribution).'
+                        )
+
+                synthetic_config = peft.LoraConfig(
+                    r=rank,
+                    lora_alpha=rank,  # alpha=rank → scale=1.0 baseline
+                    lora_dropout=0.0,
+                    bias='none',
+                    target_modules=target_linear_modules,
+                )
+                if is_main_process():
+                    print(
+                        f'[runtime_adapters] loading {sft_file} as frozen '
+                        f'adapter "{adapter_name}" (weight={weight}, '
+                        f'inferred rank={rank})'
+                    )
+                self.lora_model.add_adapter(adapter_name, synthetic_config)
+
+                # Now overwrite the freshly-added adapter's lora_A/lora_B
+                # parameters with the saved weights. PEFT names them
+                #   <module_path>.lora_A.<adapter_name>.weight
+                # so we rewrite the keys from the saved-file convention
+                # (<module_path>.lora_A.weight) to that form.
+                model_param_names = set(
+                    n for n, _ in self.transformer.named_parameters()
+                )
+                rewritten = {}
+                n_loaded = 0
+                n_skipped = 0
+                for k, v in normalized.items():
+                    if k.endswith('.lora_A.weight'):
+                        k_new = k[: -len('.lora_A.weight')] + f'.lora_A.{adapter_name}.weight'
+                    elif k.endswith('.lora_B.weight'):
+                        k_new = k[: -len('.lora_B.weight')] + f'.lora_B.{adapter_name}.weight'
+                    else:
+                        # Stray non-LoRA key (rare); ignore.
+                        n_skipped += 1
+                        continue
+                    if k_new in model_param_names:
+                        rewritten[k_new] = v
+                        n_loaded += 1
+                    else:
+                        n_skipped += 1
+                if not rewritten:
+                    raise RuntimeError(
+                        f'runtime_adapters file {sft_file}: no LoRA keys '
+                        'matched any module in the wrapped transformer '
+                        '(target_modules mismatch or unexpected key prefixes)'
+                    )
+                missing, unexpected = self.transformer.load_state_dict(
+                    rewritten, strict=False
+                )
+                if is_main_process():
+                    print(
+                        f'[runtime_adapters] "{adapter_name}": loaded '
+                        f'{n_loaded} LoRA tensors, skipped {n_skipped} '
+                        f'(load_state_dict: {len(unexpected)} unexpected keys)'
+                    )
+
             runtime_specs.append((adapter_name, weight))
 
         if runtime_specs:
