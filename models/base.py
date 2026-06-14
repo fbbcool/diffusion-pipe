@@ -501,6 +501,13 @@ class CommonPipeline:
             if p.requires_grad:
                 p.data = p.data.to(adapter_config['dtype'])
 
+        # Better init for LoKr, avoids very small starting gradients that takes a long time to recover from.
+        for name, p in self.lora_model.named_parameters():
+            if 'lokr_w1.' in name:
+                nn.init.ones_(p)
+            elif 'lokr_w2.' in name:
+                nn.init.zeros_(p)
+
         load_runtime_adapters(self.lora_model, target_model, target_linear_modules, adapter_config)
 
     @torch.no_grad()
