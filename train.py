@@ -518,7 +518,7 @@ if __name__ == '__main__':
         quit()
 
     if args.test_sample:
-        model.prepare_sample_test('a golden retriever running through a grassy field', cfg=1)
+        model.prepare_sample_test('a golden retriever running through a grassy field', cfg=5)
 
     model.load_diffusion_model()
 
