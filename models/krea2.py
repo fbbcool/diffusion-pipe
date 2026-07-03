@@ -39,17 +39,16 @@ class Krea2Pipeline(ComfyPipeline):
         # The krea2 VAE is the qwen-image VAE — a 3D/temporal VAE (comfy latent_dim==3). Comfy's
         # VAE.encode turns a 4D image batch (b,c,h,w) into ONE b-frame clip (batch axis -> temporal),
         # yielding a single latent per batch and breaking len(latents)==len(metadata) during caching.
-        # So we feed each image as its own length-1 clip (5D input, which comfy leaves untouched) and
-        # squeeze the temporal axis back off — one 4D latent per image, which prepare_inputs expects.
+        # So we feed each image as its own length-1 clip (5D input, which comfy leaves untouched),
+        # giving one 5D latent (b,c,1,h,w) per image. We keep the temporal axis here because the
+        # Wan21 latent format's process_latent_in is 5D; prepare_inputs squeezes it after that step.
         @torch.inference_mode()
         def fn(images):
             images = images.to('cuda')
             images = images.movedim(1, -1)    # (b,c,h,w) -> (b,h,w,c)
             images = images.unsqueeze(1)      # -> (b,1,h,w,c): one 1-frame clip per image
             images = (images + 1) / 2         # comfy expects pixels in [0,1]
-            latents = vae.encode(images)      # comfy VAE.encode -> (b,c,1,h,w)
-            if latents.ndim == 5:
-                latents = latents.squeeze(2)  # -> (b,c,h,w)
+            latents = vae.encode(images)      # comfy VAE.encode -> (b,c,1,h,w), kept 5D
             return {'latents': latents}
         return fn
 
@@ -111,7 +110,15 @@ class Krea2Pipeline(ComfyPipeline):
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
+        # The Wan21 latent format's process_latent_in is 5D (latents_mean/std carry a temporal axis).
+        # Cached latents may be 4D (bs,c,h,w) or 5D (bs,c,1,h,w) depending on when they were cached,
+        # so ensure a length-1 frame axis, apply process_latent_in, then squeeze back to 4D for the
+        # rest of prepare_inputs + the (image-mode) DiT.
+        if latents.ndim == 4:
+            latents = latents.unsqueeze(2)
         latents = self.model_patcher.model.process_latent_in(latents)
+        if latents.ndim == 5:
+            latents = latents.squeeze(2)
         text_embeds = inputs['text_embeds_0']
         attention_mask = inputs['attention_mask_0']
         mask = inputs['mask']
