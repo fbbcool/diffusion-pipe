@@ -35,6 +35,24 @@ class Krea2Pipeline(ComfyPipeline):
         super().__init__(*args, **kwargs)
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
 
+    def get_call_vae_fn(self, vae):
+        # The krea2 VAE is the qwen-image VAE — a 3D/temporal VAE (comfy latent_dim==3). Comfy's
+        # VAE.encode turns a 4D image batch (b,c,h,w) into ONE b-frame clip (batch axis -> temporal),
+        # yielding a single latent per batch and breaking len(latents)==len(metadata) during caching.
+        # So we feed each image as its own length-1 clip (5D input, which comfy leaves untouched) and
+        # squeeze the temporal axis back off — one 4D latent per image, which prepare_inputs expects.
+        @torch.inference_mode()
+        def fn(images):
+            images = images.to('cuda')
+            images = images.movedim(1, -1)    # (b,c,h,w) -> (b,h,w,c)
+            images = images.unsqueeze(1)      # -> (b,1,h,w,c): one 1-frame clip per image
+            images = (images + 1) / 2         # comfy expects pixels in [0,1]
+            latents = vae.encode(images)      # comfy VAE.encode -> (b,c,1,h,w)
+            if latents.ndim == 5:
+                latents = latents.squeeze(2)  # -> (b,c,h,w)
+            return {'latents': latents}
+        return fn
+
     def get_call_text_encoder_fn(self, text_encoder):
         # Same as ComfyPipeline.get_call_text_encoder_fn, but the Krea2 text encoder drops the
         # attention_mask from `extra` when every token is valid (no padding). That happens whenever
