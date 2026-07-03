@@ -8,8 +8,10 @@ from torch import nn
 import torch.nn.functional as F
 from einops import rearrange
 
+import peft
+
 from models.base import ComfyPipeline, make_contiguous, tokenize
-from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift
+from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, is_main_process
 from utils.offloading import ModelOffloader
 import comfy.ldm.common_dit
 from comfy.ldm.flux.layers import timestep_embedding
@@ -26,14 +28,48 @@ from comfy.ldm.flux.layers import timestep_embedding
 class Krea2Pipeline(ComfyPipeline):
     name = 'krea2'
     checkpointable_layers = ['InitialLayer', 'TransformerLayer']
-    adapter_target_modules = ['SingleStreamBlock']
-    # Keep the patch-embed, timestep/text projections, text-fusion adapter and final layer in
-    # high precision; only the 28 main SingleStreamBlocks are cast down (and LoRA-targeted).
+    # LoRA-target the 28 SingleStreamBlocks AND the text-conditioning pathway (the TextFusion
+    # transformer + the txtmlp projection, the latter handled by name in configure_adapter). Both
+    # the official upstream diffusion-pipe krea2 and ai-toolkit train this text pathway — freezing
+    # it (blocks-only) prevents a trigger-word concept from binding into the image stream.
+    adapter_target_modules = ['SingleStreamBlock', 'TextFusionTransformer']
+    # These stay bf16 (not fp8) — but txtfusion/txtmlp are still LoRA-targeted above.
     keep_in_high_precision = ['first', 'tmlp', 'tproj', 'txtfusion', 'txtmlp', 'last']
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
+
+    def configure_adapter(self, adapter_config):
+        # Like ComfyPipeline.configure_adapter, but also picks up the `txtmlp` Sequential (which is
+        # not its own class in adapter_target_modules) by name — matching upstream diffusion-pipe.
+        target_model = self.diffusion_model
+        target_linear_modules = set()
+        for name, module in target_model.named_modules():
+            if module.__class__.__name__ not in self.adapter_target_modules and 'txtmlp' not in name:
+                continue
+            for full_submodule_name, submodule in module.named_modules(prefix=name):
+                if isinstance(submodule, nn.Linear):
+                    target_linear_modules.add(full_submodule_name)
+        target_linear_modules = list(target_linear_modules)
+
+        if adapter_config['type'] != 'lora':
+            raise NotImplementedError(f"Adapter type {adapter_config['type']} is not implemented")
+        peft_config = peft.LoraConfig(
+            r=adapter_config['rank'],
+            lora_alpha=adapter_config['alpha'],
+            lora_dropout=adapter_config['dropout'],
+            bias='none',
+            target_modules=target_linear_modules,
+        )
+        self.peft_config = peft_config
+        self.lora_model = peft.get_peft_model(target_model, peft_config)
+        if is_main_process():
+            self.lora_model.print_trainable_parameters()
+        for name, p in target_model.named_parameters():
+            p.original_name = name
+            if p.requires_grad:
+                p.data = p.data.to(adapter_config['dtype'])
 
     def get_call_vae_fn(self, vae):
         # The krea2 VAE is the qwen-image VAE — a 3D/temporal VAE (comfy latent_dim==3). Comfy's
