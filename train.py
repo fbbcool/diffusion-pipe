@@ -360,6 +360,9 @@ if __name__ == '__main__':
     elif model_type == 'ernie_image':
         from models import ernie_image
         model = ernie_image.ErnieImagePipeline(config)
+    elif model_type == 'krea2':
+        from models import krea2
+        model = krea2.Krea2Pipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
