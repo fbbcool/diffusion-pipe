@@ -10,7 +10,7 @@ from einops import rearrange
 
 import peft
 
-from models.base import ComfyPipeline, make_contiguous, tokenize
+from models.base import ComfyPipeline, load_runtime_adapters, make_contiguous, tokenize
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, is_main_process
 from utils.offloading import ModelOffloader
 import comfy.ldm.common_dit
@@ -70,6 +70,11 @@ class Krea2Pipeline(ComfyPipeline):
             p.original_name = name
             if p.requires_grad:
                 p.data = p.data.to(adapter_config['dtype'])
+
+        # Frozen runtime_adapters (see load_runtime_adapters in base.py). The synthetic
+        # LoraConfig for single-file adapters uses this method's target_linear_modules, so
+        # frozen krea2 LoRAs get their txtfusion/txtmlp keys matched, not just the blocks.
+        load_runtime_adapters(self.lora_model, target_model, target_linear_modules, adapter_config)
 
     def get_call_vae_fn(self, vae):
         # The krea2 VAE is the qwen-image VAE — a 3D/temporal VAE (comfy latent_dim==3). Comfy's

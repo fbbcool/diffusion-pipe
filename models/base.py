@@ -163,6 +163,263 @@ class PreprocessMediaFile:
             return [(video, mask) for video in videos]
 
 
+def load_runtime_adapters(lora_model, wrapped_model, target_linear_modules, adapter_config):
+    # ---- runtime_adapters ---------------------------------------------
+    # Load additional LoRAs that contribute to the forward pass but are
+    # NOT trained or saved with this run. Use case: train a new LoRA
+    # whose effective base includes one or more existing LoRAs at their
+    # inference strengths, so the trained LoRA learns a delta that
+    # COEXISTS with them rather than one that erodes them in pursuit of
+    # the dataset distribution.
+    #
+    # Contrast with `merge_adapters` (qwen_image.py): that path bakes
+    # adapter deltas into base weights at load. The trained LoRA then
+    # has full freedom to undo those merged contributions because they
+    # are inside its trainable parameter space. `runtime_adapters` keeps
+    # the existing adapters STRUCTURALLY OUTSIDE the trainable space.
+    #
+    # Each entry is a dict:
+    #   path:    either a PEFT-style adapter directory (adapter_config.json
+    #            + adapter_model.safetensors) OR a single .safetensors file
+    #            in ComfyUI/inference format, OR a directory containing one
+    #            such .safetensors. The latter two cases derive rank/alpha
+    #            from the tensors directly (matches `merge_adapters`
+    #            behavior in qwen_image.py).
+    #   name:    optional adapter name (default: file/dir basename)
+    #   weight:  optional float strength multiplier (default: 1.0)
+    #
+    # Example TOML:
+    #   [[adapter.runtime_adapters]]
+    #   path   = '/path/to/xlasm10.safetensors'
+    #   weight = 0.8
+    runtime_entries = adapter_config.get('runtime_adapters', []) or []
+    runtime_specs: list[tuple[str, float]] = []
+    for entry in runtime_entries:
+        if not isinstance(entry, dict):
+            raise RuntimeError(
+                'runtime_adapters entry must be a dict with keys '
+                f'{{path, name?, weight?}}, got: {entry!r}'
+            )
+        raw_path = entry.get('path')
+        if not raw_path:
+            raise RuntimeError(
+                f"runtime_adapters entry missing 'path' key: {entry!r}"
+            )
+        adapter_path = Path(raw_path)
+        if adapter_path.is_file():
+            adapter_dir = adapter_path.parent
+            explicit_file = adapter_path
+        elif adapter_path.is_dir():
+            adapter_dir = adapter_path
+            explicit_file = None
+        else:
+            raise RuntimeError(
+                f'runtime_adapters path does not exist: {raw_path}'
+            )
+        adapter_name = entry.get('name') or (
+            adapter_path.stem if explicit_file else adapter_dir.name
+        )
+        if adapter_name == 'default':
+            raise RuntimeError(
+                "runtime_adapters entry name 'default' conflicts with "
+                'the trainable adapter; choose a different name'
+            )
+        weight = float(entry.get('weight', 1.0))
+
+        # An explicitly-given .safetensors file is always parsed as a
+        # single-file LoRA, even when it sits next to an adapter_config.json
+        # (e.g. epochN/adapter_model.safetensors saved by this repo -- those
+        # files carry ComfyUI-style 'diffusion_model.' key prefixes that
+        # PEFT's directory loader does not understand).
+        has_peft_config = explicit_file is None and (adapter_dir / 'adapter_config.json').exists()
+        if has_peft_config:
+            # PEFT directory layout (e.g. produced by diffusion-pipe's
+            # own save_adapter). PEFT reads the config, applies the
+            # saved target_modules, and loads the safetensors.
+            if is_main_process():
+                print(
+                    f'[runtime_adapters] loading {adapter_dir} as frozen '
+                    f'adapter "{adapter_name}" (weight={weight}, PEFT-dir)'
+                )
+            lora_model.load_adapter(
+                str(adapter_dir), adapter_name=adapter_name
+            )
+        else:
+            # ComfyUI / inference single-file format: no adapter_config.json.
+            # Locate the .safetensors, derive rank from key shapes, build a
+            # synthetic LoraConfig matching the trainable adapter's target
+            # modules, and load weights with manual key remapping.
+            if explicit_file is not None:
+                sft_file = explicit_file
+            else:
+                sft_files = list(adapter_dir.glob('*.safetensors'))
+                if len(sft_files) != 1:
+                    raise RuntimeError(
+                        f'runtime_adapters dir {adapter_dir} has no '
+                        'adapter_config.json and must contain exactly one '
+                        f'.safetensors file (found {len(sft_files)})'
+                    )
+                sft_file = sft_files[0]
+
+            sd = safetensors.torch.load_file(str(sft_file))
+            # Strip prefix to match base parameter naming (same regex
+            # convention as load_adapter_weights and merge_adapters).
+            normalized = {}
+            a_ranks: list[int] = []
+            for k, v in sd.items():
+                k2 = re.sub(r'^(transformer|diffusion_model)\.', '', k)
+                normalized[k2] = v
+                if k2.endswith('.lora_A.weight'):
+                    a_ranks.append(v.shape[0])
+            if not a_ranks:
+                raise RuntimeError(
+                    f'runtime_adapters file {sft_file} has no '
+                    "'lora_A.weight' tensors — not a recognizable LoRA"
+                )
+            # Common case: all lora_A tensors share rank. If they don't
+            # (rare), use the max — PEFT will allocate that many rank
+            # slots; smaller lora_A tensors are padded by load_state_dict
+            # (no, actually strict=False just skips them — pre-warn).
+            rank = a_ranks[0]
+            if any(r != rank for r in a_ranks):
+                if is_main_process():
+                    print(
+                        '[runtime_adapters] WARN: non-uniform rank in '
+                        f'{sft_file} (ranks={sorted(set(a_ranks))}); '
+                        f'using rank={rank}. Modules with a different '
+                        'rank will fall back to PEFT init (zero contribution).'
+                    )
+
+            synthetic_config = peft.LoraConfig(
+                r=rank,
+                lora_alpha=rank,  # alpha=rank → scale=1.0 baseline
+                lora_dropout=0.0,
+                bias='none',
+                target_modules=target_linear_modules,
+            )
+            if is_main_process():
+                print(
+                    f'[runtime_adapters] loading {sft_file} as frozen '
+                    f'adapter "{adapter_name}" (weight={weight}, '
+                    f'inferred rank={rank})'
+                )
+            lora_model.add_adapter(adapter_name, synthetic_config)
+
+            # Now overwrite the freshly-added adapter's lora_A/lora_B
+            # parameters with the saved weights. PEFT names them
+            #   <module_path>.lora_A.<adapter_name>.weight
+            # so we rewrite the keys from the saved-file convention
+            # (<module_path>.lora_A.weight) to that form.
+            model_param_names = set(
+                n for n, _ in wrapped_model.named_parameters()
+            )
+            rewritten = {}
+            n_loaded = 0
+            n_skipped = 0
+            for k, v in normalized.items():
+                if k.endswith('.lora_A.weight'):
+                    k_new = k[: -len('.lora_A.weight')] + f'.lora_A.{adapter_name}.weight'
+                elif k.endswith('.lora_B.weight'):
+                    k_new = k[: -len('.lora_B.weight')] + f'.lora_B.{adapter_name}.weight'
+                else:
+                    # Stray non-LoRA key (rare); ignore.
+                    n_skipped += 1
+                    continue
+                if k_new in model_param_names:
+                    rewritten[k_new] = v
+                    n_loaded += 1
+                else:
+                    n_skipped += 1
+            if not rewritten:
+                raise RuntimeError(
+                    f'runtime_adapters file {sft_file}: no LoRA keys '
+                    'matched any module in the wrapped transformer '
+                    '(target_modules mismatch or unexpected key prefixes)'
+                )
+            missing, unexpected = wrapped_model.load_state_dict(
+                rewritten, strict=False
+            )
+            if is_main_process():
+                print(
+                    f'[runtime_adapters] "{adapter_name}": loaded '
+                    f'{n_loaded} LoRA tensors, skipped {n_skipped} '
+                    f'(load_state_dict: {len(unexpected)} unexpected keys)'
+                )
+
+        runtime_specs.append((adapter_name, weight))
+
+    if runtime_specs:
+        # Activate trainable 'default' alongside all runtime adapters
+        # so they all contribute to the forward pass. PEFT applies
+        # their deltas in parallel within each LoraLayer.
+        active = ['default'] + [n for n, _ in runtime_specs]
+        # PeftModel.set_adapter rejects lists on many PEFT versions
+        # (`TypeError: unhashable type: 'list'` from a `name in dict`
+        # check inside PeftModel.set_adapter). Bypass it and call
+        # set_adapter on each tuner layer directly — every LoraLayer's
+        # set_adapter accepts a list and activates all listed adapters
+        # simultaneously. This is also what the tuner-level
+        # LoraModel.set_adapter wrapper does internally, just with
+        # stricter validation upstream.
+        from peft.tuners.tuners_utils import BaseTunerLayer
+        for module in lora_model.modules():
+            if isinstance(module, BaseTunerLayer):
+                module.set_adapter(active)
+
+        # Freeze runtime adapter parameters. PEFT's set_adapter may
+        # re-enable gradients on active adapters in some versions, so
+        # we freeze AFTER set_adapter to guarantee the final state.
+        # Both the saver (utils/saver.py) and DeepSpeed gradient
+        # collection gate on requires_grad, so this is the single
+        # switch that excludes them from training.
+        n_frozen_total = 0
+        for adapter_name, _ in runtime_specs:
+            n_frozen = 0
+            key_a = f'.{adapter_name}.weight'
+            key_b = f'.{adapter_name}.bias'
+            for pname, p in lora_model.named_parameters():
+                if key_a in pname or key_b in pname:
+                    p.requires_grad = False
+                    # Cast to trainable adapter's dtype for compute
+                    # uniformity; PEFT defaults loaded adapters to
+                    # fp32, which mismatches the bf16 forward pass.
+                    p.data = p.data.to(adapter_config['dtype'])
+                    n_frozen += 1
+            n_frozen_total += n_frozen
+
+        # Apply per-adapter strength. PEFT's per-adapter scaling lives
+        # on each LoraLayer instance as a dict; multiplying it by the
+        # user weight is the most version-portable handle (the
+        # set_scale / set_adapter_scale helpers have come and gone
+        # across PEFT releases).
+        for module in lora_model.modules():
+            scaling = getattr(module, 'scaling', None)
+            if not isinstance(scaling, dict):
+                continue
+            for adapter_name, weight in runtime_specs:
+                if adapter_name in scaling and weight != 1.0:
+                    scaling[adapter_name] = scaling[adapter_name] * weight
+
+        # Defensive: ensure every parameter has `original_name` set
+        # (the saver relies on it for any param that ever flips to
+        # requires_grad=True; runtime params don't, but future code
+        # might walk all params).
+        for name, p in wrapped_model.named_parameters():
+            if not hasattr(p, 'original_name'):
+                p.original_name = name
+
+        if is_main_process():
+            print(
+                f'[runtime_adapters] active adapter list: {active} '
+                f'(froze {n_frozen_total} runtime params across '
+                f'{len(runtime_specs)} adapter(s))'
+            )
+            # Re-print trainable count so the user sees that the
+            # frozen adapters did NOT bump the trainable parameter
+            # tally.
+            lora_model.print_trainable_parameters()
+
+
 class BasePipeline:
     framerate = None
     pixels_round_to_multiple = 16
@@ -206,255 +463,7 @@ class BasePipeline:
             if p.requires_grad:
                 p.data = p.data.to(adapter_config['dtype'])
 
-        # ---- runtime_adapters ---------------------------------------------
-        # Load additional LoRAs that contribute to the forward pass but are
-        # NOT trained or saved with this run. Use case: train a new LoRA
-        # whose effective base includes one or more existing LoRAs at their
-        # inference strengths, so the trained LoRA learns a delta that
-        # COEXISTS with them rather than one that erodes them in pursuit of
-        # the dataset distribution.
-        #
-        # Contrast with `merge_adapters` (qwen_image.py): that path bakes
-        # adapter deltas into base weights at load. The trained LoRA then
-        # has full freedom to undo those merged contributions because they
-        # are inside its trainable parameter space. `runtime_adapters` keeps
-        # the existing adapters STRUCTURALLY OUTSIDE the trainable space.
-        #
-        # Each entry is a dict:
-        #   path:    either a PEFT-style adapter directory (adapter_config.json
-        #            + adapter_model.safetensors) OR a single .safetensors file
-        #            in ComfyUI/inference format, OR a directory containing one
-        #            such .safetensors. The latter two cases derive rank/alpha
-        #            from the tensors directly (matches `merge_adapters`
-        #            behavior in qwen_image.py).
-        #   name:    optional adapter name (default: file/dir basename)
-        #   weight:  optional float strength multiplier (default: 1.0)
-        #
-        # Example TOML:
-        #   [[adapter.runtime_adapters]]
-        #   path   = '/path/to/xlasm10.safetensors'
-        #   weight = 0.8
-        runtime_entries = adapter_config.get('runtime_adapters', []) or []
-        runtime_specs: list[tuple[str, float]] = []
-        for entry in runtime_entries:
-            if not isinstance(entry, dict):
-                raise RuntimeError(
-                    'runtime_adapters entry must be a dict with keys '
-                    f'{{path, name?, weight?}}, got: {entry!r}'
-                )
-            raw_path = entry.get('path')
-            if not raw_path:
-                raise RuntimeError(
-                    f"runtime_adapters entry missing 'path' key: {entry!r}"
-                )
-            adapter_path = Path(raw_path)
-            if adapter_path.is_file():
-                adapter_dir = adapter_path.parent
-                explicit_file = adapter_path
-            elif adapter_path.is_dir():
-                adapter_dir = adapter_path
-                explicit_file = None
-            else:
-                raise RuntimeError(
-                    f'runtime_adapters path does not exist: {raw_path}'
-                )
-            adapter_name = entry.get('name') or (
-                adapter_path.stem if explicit_file else adapter_dir.name
-            )
-            if adapter_name == 'default':
-                raise RuntimeError(
-                    "runtime_adapters entry name 'default' conflicts with "
-                    'the trainable adapter; choose a different name'
-                )
-            weight = float(entry.get('weight', 1.0))
-
-            has_peft_config = (adapter_dir / 'adapter_config.json').exists()
-            if has_peft_config:
-                # PEFT directory layout (e.g. produced by diffusion-pipe's
-                # own save_adapter). PEFT reads the config, applies the
-                # saved target_modules, and loads the safetensors.
-                if is_main_process():
-                    print(
-                        f'[runtime_adapters] loading {adapter_dir} as frozen '
-                        f'adapter "{adapter_name}" (weight={weight}, PEFT-dir)'
-                    )
-                self.lora_model.load_adapter(
-                    str(adapter_dir), adapter_name=adapter_name
-                )
-            else:
-                # ComfyUI / inference single-file format: no adapter_config.json.
-                # Locate the .safetensors, derive rank from key shapes, build a
-                # synthetic LoraConfig matching the trainable adapter's target
-                # modules, and load weights with manual key remapping.
-                if explicit_file is not None:
-                    sft_file = explicit_file
-                else:
-                    sft_files = list(adapter_dir.glob('*.safetensors'))
-                    if len(sft_files) != 1:
-                        raise RuntimeError(
-                            f'runtime_adapters dir {adapter_dir} has no '
-                            'adapter_config.json and must contain exactly one '
-                            f'.safetensors file (found {len(sft_files)})'
-                        )
-                    sft_file = sft_files[0]
-
-                sd = safetensors.torch.load_file(str(sft_file))
-                # Strip prefix to match base parameter naming (same regex
-                # convention as load_adapter_weights and merge_adapters).
-                normalized = {}
-                a_ranks: list[int] = []
-                for k, v in sd.items():
-                    k2 = re.sub(r'^(transformer|diffusion_model)\.', '', k)
-                    normalized[k2] = v
-                    if k2.endswith('.lora_A.weight'):
-                        a_ranks.append(v.shape[0])
-                if not a_ranks:
-                    raise RuntimeError(
-                        f'runtime_adapters file {sft_file} has no '
-                        "'lora_A.weight' tensors — not a recognizable LoRA"
-                    )
-                # Common case: all lora_A tensors share rank. If they don't
-                # (rare), use the max — PEFT will allocate that many rank
-                # slots; smaller lora_A tensors are padded by load_state_dict
-                # (no, actually strict=False just skips them — pre-warn).
-                rank = a_ranks[0]
-                if any(r != rank for r in a_ranks):
-                    if is_main_process():
-                        print(
-                            '[runtime_adapters] WARN: non-uniform rank in '
-                            f'{sft_file} (ranks={sorted(set(a_ranks))}); '
-                            f'using rank={rank}. Modules with a different '
-                            'rank will fall back to PEFT init (zero contribution).'
-                        )
-
-                synthetic_config = peft.LoraConfig(
-                    r=rank,
-                    lora_alpha=rank,  # alpha=rank → scale=1.0 baseline
-                    lora_dropout=0.0,
-                    bias='none',
-                    target_modules=target_linear_modules,
-                )
-                if is_main_process():
-                    print(
-                        f'[runtime_adapters] loading {sft_file} as frozen '
-                        f'adapter "{adapter_name}" (weight={weight}, '
-                        f'inferred rank={rank})'
-                    )
-                self.lora_model.add_adapter(adapter_name, synthetic_config)
-
-                # Now overwrite the freshly-added adapter's lora_A/lora_B
-                # parameters with the saved weights. PEFT names them
-                #   <module_path>.lora_A.<adapter_name>.weight
-                # so we rewrite the keys from the saved-file convention
-                # (<module_path>.lora_A.weight) to that form.
-                model_param_names = set(
-                    n for n, _ in self.transformer.named_parameters()
-                )
-                rewritten = {}
-                n_loaded = 0
-                n_skipped = 0
-                for k, v in normalized.items():
-                    if k.endswith('.lora_A.weight'):
-                        k_new = k[: -len('.lora_A.weight')] + f'.lora_A.{adapter_name}.weight'
-                    elif k.endswith('.lora_B.weight'):
-                        k_new = k[: -len('.lora_B.weight')] + f'.lora_B.{adapter_name}.weight'
-                    else:
-                        # Stray non-LoRA key (rare); ignore.
-                        n_skipped += 1
-                        continue
-                    if k_new in model_param_names:
-                        rewritten[k_new] = v
-                        n_loaded += 1
-                    else:
-                        n_skipped += 1
-                if not rewritten:
-                    raise RuntimeError(
-                        f'runtime_adapters file {sft_file}: no LoRA keys '
-                        'matched any module in the wrapped transformer '
-                        '(target_modules mismatch or unexpected key prefixes)'
-                    )
-                missing, unexpected = self.transformer.load_state_dict(
-                    rewritten, strict=False
-                )
-                if is_main_process():
-                    print(
-                        f'[runtime_adapters] "{adapter_name}": loaded '
-                        f'{n_loaded} LoRA tensors, skipped {n_skipped} '
-                        f'(load_state_dict: {len(unexpected)} unexpected keys)'
-                    )
-
-            runtime_specs.append((adapter_name, weight))
-
-        if runtime_specs:
-            # Activate trainable 'default' alongside all runtime adapters
-            # so they all contribute to the forward pass. PEFT applies
-            # their deltas in parallel within each LoraLayer.
-            active = ['default'] + [n for n, _ in runtime_specs]
-            # PeftModel.set_adapter rejects lists on many PEFT versions
-            # (`TypeError: unhashable type: 'list'` from a `name in dict`
-            # check inside PeftModel.set_adapter). Bypass it and call
-            # set_adapter on each tuner layer directly — every LoraLayer's
-            # set_adapter accepts a list and activates all listed adapters
-            # simultaneously. This is also what the tuner-level
-            # LoraModel.set_adapter wrapper does internally, just with
-            # stricter validation upstream.
-            from peft.tuners.tuners_utils import BaseTunerLayer
-            for module in self.lora_model.modules():
-                if isinstance(module, BaseTunerLayer):
-                    module.set_adapter(active)
-
-            # Freeze runtime adapter parameters. PEFT's set_adapter may
-            # re-enable gradients on active adapters in some versions, so
-            # we freeze AFTER set_adapter to guarantee the final state.
-            # Both the saver (utils/saver.py) and DeepSpeed gradient
-            # collection gate on requires_grad, so this is the single
-            # switch that excludes them from training.
-            n_frozen_total = 0
-            for adapter_name, _ in runtime_specs:
-                n_frozen = 0
-                key_a = f'.{adapter_name}.weight'
-                key_b = f'.{adapter_name}.bias'
-                for pname, p in self.lora_model.named_parameters():
-                    if key_a in pname or key_b in pname:
-                        p.requires_grad = False
-                        # Cast to trainable adapter's dtype for compute
-                        # uniformity; PEFT defaults loaded adapters to
-                        # fp32, which mismatches the bf16 forward pass.
-                        p.data = p.data.to(adapter_config['dtype'])
-                        n_frozen += 1
-                n_frozen_total += n_frozen
-
-            # Apply per-adapter strength. PEFT's per-adapter scaling lives
-            # on each LoraLayer instance as a dict; multiplying it by the
-            # user weight is the most version-portable handle (the
-            # set_scale / set_adapter_scale helpers have come and gone
-            # across PEFT releases).
-            for module in self.lora_model.modules():
-                scaling = getattr(module, 'scaling', None)
-                if not isinstance(scaling, dict):
-                    continue
-                for adapter_name, weight in runtime_specs:
-                    if adapter_name in scaling and weight != 1.0:
-                        scaling[adapter_name] = scaling[adapter_name] * weight
-
-            # Defensive: ensure every parameter has `original_name` set
-            # (the saver relies on it for any param that ever flips to
-            # requires_grad=True; runtime params don't, but future code
-            # might walk all params).
-            for name, p in self.transformer.named_parameters():
-                if not hasattr(p, 'original_name'):
-                    p.original_name = name
-
-            if is_main_process():
-                print(
-                    f'[runtime_adapters] active adapter list: {active} '
-                    f'(froze {n_frozen_total} runtime params across '
-                    f'{len(runtime_specs)} adapter(s))'
-                )
-                # Re-print trainable count so the user sees that the
-                # frozen adapters did NOT bump the trainable parameter
-                # tally.
-                self.lora_model.print_trainable_parameters()
+        load_runtime_adapters(self.lora_model, self.transformer, target_linear_modules, adapter_config)
 
     def save_adapter(self, save_dir, peft_state_dict):
         raise NotImplementedError()
@@ -737,6 +746,8 @@ class ComfyPipeline:
             p.original_name = name
             if p.requires_grad:
                 p.data = p.data.to(adapter_config['dtype'])
+
+        load_runtime_adapters(self.lora_model, self.diffusion_model, target_linear_modules, adapter_config)
 
     def save_adapter(self, save_dir, sd):
         self.peft_config.save_pretrained(save_dir)
