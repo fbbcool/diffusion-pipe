@@ -378,6 +378,9 @@ if __name__ == '__main__':
     elif model_type == 'ideogram4':
         from models import ideogram4
         model = ideogram4.Ideogram4Pipeline(config)
+    elif model_type == 'minimax_h3':
+        from models import minimax_h3
+        model = minimax_h3.MinimaxH3Pipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
@@ -416,6 +419,10 @@ if __name__ == '__main__':
         eval_image_micro_batch_size_per_gpu = {None: eval_image_micro_batch_size_per_gpu}
     elif isinstance(eval_image_micro_batch_size_per_gpu, list):
         eval_image_micro_batch_size_per_gpu = {x[0]: x[1] for x in eval_image_micro_batch_size_per_gpu}
+
+    if model_type == 'minimax_h3':
+        if not all(x == 1 for x in (micro_batch_size_per_gpu, eval_micro_batch_size_per_gpu, image_micro_batch_size_per_gpu, eval_image_micro_batch_size_per_gpu)):
+            raise ValueError('Minimax H3 currently requires micro_batch_size_per_gpu=1')
 
     default_micro_batch_size_per_gpu = list(micro_batch_size_per_gpu.values())[0]
 
@@ -518,7 +525,7 @@ if __name__ == '__main__':
         quit()
 
     if args.test_sample:
-        model.prepare_sample_test('a golden retriever running through a grassy field', cfg=5)
+        model.prepare_sample_test('a golden retriever running through a grassy field', cfg=1)
 
     model.load_diffusion_model()
 
