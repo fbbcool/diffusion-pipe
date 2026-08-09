@@ -537,6 +537,7 @@ class CommonPipeline:
                 lora_dropout=adapter_config['dropout'],
                 bias='none',
                 target_modules=target_modules,
+                exclude_modules=adapter_config.get('exclude_modules', None),
             )
         elif adapter_type == 'lokr':
             peft_config = peft.LoKrConfig(
@@ -545,6 +546,7 @@ class CommonPipeline:
                 alpha=adapter_config['alpha'],
                 rank_dropout=adapter_config['rank_dropout'],
                 target_modules=target_modules,
+                exclude_modules=adapter_config.get('exclude_modules', None),
             )
         else:
             raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
