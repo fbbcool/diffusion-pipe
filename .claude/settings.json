@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git status:*)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git remote:*)",
+      "Bash(git submodule status:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(vikunja_board:*)",
+      "Read(//home/misw/Repos/fbbcool/diffusion-pipe/**)"
+    ]
+  }
+}

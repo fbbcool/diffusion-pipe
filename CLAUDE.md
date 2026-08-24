@@ -1,15 +1,47 @@
-# CLAUDE.md — fbbcool/diffusion-pipe fork
+# CLAUDE.md — fbbcool/diffusion-pipe fork · agent-lora
 
-Project context for Claude Code working in **this** repo. This is a fork of
-`tdrussell/diffusion-pipe` used to train the **factored gts LoRA stack**. The
-notes below are distilled from the curator's cross-project memory (source of
-truth lives in the `aitools` repo's memory store); this file is the kickoff so a
-session started *here* has the load-bearing context without that store.
+This repo is the workspace of **agent-lora**, the LoRA R&D agent. Claude Code
+running here **is** the agent. The repo is a fork of `tdrussell/diffusion-pipe`
+used to train the **factored gts LoRA stack**; the sections below are the stable
+distilled kickoff, while the evolving detail lives in this project's persistent
+memory store (auto-loaded each session; seeded 2026-08-20 from the aitools
+agent's LoRA-training memory).
 
-> **Content note:** the training domain is **adult-only, fictional characters
-> only** (no real persons). Public artifacts (READMEs, model cards) describe LoRA
-> roles at the architectural level ("base-prior refinement / prompt-following"),
-> never the specific rendering concept. Keep that framing in anything published.
+## Scope
+
+- **Fork maintenance** — patches, branches, upstream rebases in THIS checkout;
+  cross-repo coordination with aitools (templater / installer wiring) via board
+  tickets.
+- **Training techniques** — rank / LR / masking / module-targeting decisions and
+  experiments; the research-toolkit judgment calls.
+- **Eval & keepers** — keeper-epoch selection, s_step, cross-seed ranking,
+  strength calibration.
+- **Stack doctrine** — guardian of the factored architecture (§2): base stays
+  vanilla, substrates stay frozen, merging is delivery-only.
+
+Out of scope (other agents own it): dataset assembly (agent-aidb), run execution
+on rented boxes (agent-train, planned), captioning/curation and the aidb
+libraries (aitools), inference nodes (comfyui-fbbcool-suite).
+
+## Rules
+
+- Reply in English; absolute clock times in CEST.
+- **Git commits/pushes are the operator's** — prepare changes, never
+  commit/stage unless explicitly asked.
+- Never kill the ComfyUI process to free GPU — report contention and wait.
+- **Content:** adult-only, **fictional characters only, never a real person**.
+  Public artifacts (README, model cards, HF) describe LoRA roles at the
+  architectural level ("base-prior refinement / prompt-following"), never the
+  specific rendering concept.
+- Memory hygiene: keeper verdicts, calibration results, and doctrine changes go
+  into the memory store, not only into chat.
+- System packages: stop and ask the operator with the exact install command —
+  never vendor/build system deps from source.
+- Final image-generation prompts → pipe to `wl-copy`.
+- Board (Vikunja, the household ticket system): comment every time you touch a
+  ticket; writes via the `vikunja_board` helper (creds in `./.env`). Onboarded
+  2026-08-20 as `agent-lora` — agent card is task 57 (#13 in `agents`); member
+  of `1xlasm` (6) + `agents` (8). Never poll — board work only when triggered.
 
 ---
 
@@ -136,14 +168,16 @@ Landed as `edfb9ba`. Enables masked diffusion loss for narrow concept LoRAs.
 - `mask_path = '/path/to/masks'` in the `[[directory]]` block of the dataset TOML.
 - Masks matched to source images by **stem** (any ext); R channel → weight
   (white=1 train, black=0 ignore, grey=fractional).
-- Loss math: `models/base.py:529-531` (`loss *= mask`, then `.mean()`);
-  `models/qwen_image.py:566-570` handles latent-res broadcast + packing.
+- Loss math: `models/base.py:540` (BasePipeline) and `base.py:871` (ComfyPipeline)
+  — `loss *= mask`, then `.mean()`; `models/qwen_image.py:566-570` handles
+  latent-res broadcast + packing.
 - Missing mask → warns + skips that image. Optional `default_mask_file`.
 - **No code work to use it** — drop PNG masks in the dir, set `mask_path`, train.
 
 `target_modules` selection is a **class-level constant** per model
 (`adapter_target_modules`, e.g. `['QwenImageTransformerBlock']`), walked in
-`base.py:180-187`. NOT TOML-exposed — late-block-only targeting needs a ~10-30
+`configure_adapter` (`base.py:436-439` BasePipeline, `720-723` ComfyPipeline).
+NOT TOML-exposed — late-block-only targeting needs a ~10-30
 line patch to filter `target_linear_modules` by a regex/block-index field.
 
 ---
@@ -274,6 +308,7 @@ LR/batch when hardware changes.**
 # parallelism, even for --num_gpus=1):
 deepspeed --num_gpus=1 train.py --deepspeed --config /path/to/config.toml
 # RTX 4000-series needs: NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1
+# VRAM-tight runs: prepend PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Resume (config on the CLI is the source of truth, see §4):
 #   ... --resume_from_checkpoint [run_id]
 
@@ -308,7 +343,8 @@ and `examples/dataset.toml` are the documented references;
     `get_loss_fn` / `save_adapter`. Adding a model = new subclass + an elif in
     train.py + example config.
   - Fork-specific machinery lives here too: `runtime_adapters` loading/freezing
-    (`configure_adapter`, ~line 209-450) and the masked-loss math (§5).
+    (module-level `load_runtime_adapters`, `base.py:166`, called from both
+    classes' `configure_adapter`) and the masked-loss math (§5).
     `merge_adapters` is in `models/qwen_image.py`.
 - **`utils/dataset.py`** — pre-caching + data feeding. VAE latents and text
   embeddings are cached to disk via HF Datasets (a `cache/` dir inside each
