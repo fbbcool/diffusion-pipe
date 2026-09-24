@@ -1,0 +1,56 @@
+# Qwen-Image 2.1 LoRA example. See docs/supported_models.md#qwen-image-21 and
+# examples/main_example.toml for the meaning of every setting.
+output_dir = '/data/diffusion_pipe_training_runs/qwen_image21_lora'
+dataset = 'examples/dataset.toml'
+
+epochs = 50
+micro_batch_size_per_gpu = 2
+pipeline_stages = 1
+gradient_accumulation_steps = 1
+gradient_clipping = 1.0
+warmup_steps = 100
+
+# The DiT is 14 GB in bf16; with activation checkpointing a 32 GB GPU trains batch 2 at 1024px.
+activation_checkpointing = true
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 1
+steps_per_print = 1
+video_clip_mode = 'single_beginning'
+
+eval_every_n_epochs = 1
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 1
+eval_gradient_accumulation_steps = 1
+save_every_n_epochs = 2
+checkpoint_every_n_minutes = 120
+
+[model]
+type = 'qwen_image21'
+diffusion_model = '/data2/imagegen_models/comfyui-models/qwen_image_2.1_bf16.safetensors'
+vae = '/data2/imagegen_models/comfyui-models/qwen_image_2.1_vae_bf16.safetensors'
+text_encoders = [
+    {path = '/data2/imagegen_models/comfyui-models/qwen3vl_8b_bf16.safetensors', type = 'qwen_image'}
+]
+dtype = 'bfloat16'
+# Store the block linears in fp8 to halve the DiT's VRAM (bf16 kept for the small embedders/output).
+#diffusion_model_dtype = 'float8'
+timestep_sample_method = 'logit_normal'
+flux_shift = true   # model's own resolution-dependent schedule (mu 0.5 @ 256 tokens -> 0.9 @ 8192)
+#shift = 2.0        # fixed alternative == ComfyUI's mu 0.69 at 1024x1024 (multiplicative form here)
+
+[adapter]
+type = 'lora'
+rank = 16
+dtype = 'bfloat16'
+# Frozen prior LoRAs (train regime == inference regime), optional:
+#[[adapter.runtime_adapters]]
+#path = '/path/to/prior.safetensors'
+#weight = 1.0
+
+[optimizer]
+type = 'adamw_optimi'
+lr = 5e-5
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8

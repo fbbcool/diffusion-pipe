@@ -579,3 +579,40 @@ shift = 3  # probably good for any model with Flux2 VAE
 ```
 
 Use ComfyUI-compatible model files. LoRAs are saved in ComfyUI format.
+
+## Qwen-Image 2.1
+```
+[model]
+type = 'qwen_image21'
+# All files from https://huggingface.co/Comfy-Org/Qwen-Image-2.1 (ComfyUI format).
+diffusion_model = '/data2/imagegen_models/comfyui-models/qwen_image_2.1_bf16.safetensors'
+vae = '/data2/imagegen_models/comfyui-models/qwen_image_2.1_vae_bf16.safetensors'
+text_encoders = [
+    {path = '/data2/imagegen_models/comfyui-models/qwen3vl_8b_bf16.safetensors', type = 'qwen_image'}
+]
+dtype = 'bfloat16'
+# Halves the DiT's VRAM by storing the block linears in fp8 (the bf16 DiT is 14 GB). Optional.
+#diffusion_model_dtype = 'float8'
+timestep_sample_method = 'logit_normal'
+# Resolution-dependent timestep shift matching the model's own schedule (recommended)...
+flux_shift = true
+# ...or a fixed one. NOTE: this is the multiplicative shift; ComfyUI's "shift" for this model is
+# its natural log, so ComfyUI's 0.69 at 1024x1024 is shift = 2.0 here, not 0.69.
+#shift = 2.0
+```
+
+Qwen-Image 2.1 is a different model from Qwen-Image (new 7B single-stream DiT, Qwen3-VL-8B text
+encoder, 64-channel 16x VAE), so nothing trained for Qwen-Image transfers. It is loaded through
+the ComfyUI submodule; use the ComfyUI-format model files. The text encoder `type` is
+`qwen_image` (ComfyUI's `CLIPType.QWEN_IMAGE`; ComfyUI picks the 2.1 template from the 8B
+weights). Only the bf16 diffusion model is supported as the training base (the int8 "convrot"
+files are inference-only quantizations).
+
+LoRAs are saved in ComfyUI format and target every linear in the transformer blocks plus the
+`txt_in` text projection and `img_in` image embedder. `merge_adapters`, frozen `runtime_adapters`
+and masked loss work as for the other models.
+
+Prompts are encoded with the model's chat template exactly as ComfyUI does at inference. The
+text encoder is 17.5 GB in bf16; caching text embeddings is done before training, so it is not
+resident during the training loop. Images are resized to multiples of 16 pixels (one latent
+pixel = 16 image pixels, patch size 1).

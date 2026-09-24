@@ -363,6 +363,9 @@ if __name__ == '__main__':
     elif model_type == 'krea2':
         from models import krea2
         model = krea2.Krea2Pipeline(config)
+    elif model_type == 'qwen_image21':
+        from models import qwen_image21
+        model = qwen_image21.QwenImage21Pipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 

@@ -222,6 +222,17 @@ diffusers re-impl, no weight remap**.
   latent handling + LoKr) — caveat: its `prepare_inputs` skips `process_latent_in`
   (relies on the base.py VAE fn), so check that against this fork's base.py first.
 
+### qwen_image21 — patch prepared 2026-09-23, uncommitted, untested on real weights
+`models/qwen_image21.py` — `QwenImage21Pipeline(ComfyPipeline)`, comfy master's
+`comfy/ldm/qwen_image21` DiT (needs the submodule bumped past 2026-09-19). Deviations from
+comfy's forward are documented at the top of the file: out-of-place gated residual (comfy's is
+in-place → breaks autograd + checkpointing), own block-causal mask that excludes pad tokens,
+per-caption image RoPE start, tokenizer called via its own method (the shared `tokenize` helper
+skips the chat template). Text encoder TOML `type = 'qwen_image'`. **`shift` convention:**
+TOML `shift` is multiplicative, comfy's is `mu = ln(shift)` → ComfyUI 0.69 ≈ `shift = 2.0`, or
+`flux_shift = true` (mu 0.5→0.9 over 256→8192 tokens). Gates before real investment unchanged
+(vanilla 2.1 must beat krea2-snofs on gts stress prompts; full stack reset).
+
 ### ideogram4 — parked
 Single-stream DiT 34L, flow-matching, FP8 + NF4 open weights, Qwen3-VL-8B text
 encoder (13-layer concat), dual conditional+unconditional transformer. Template:
