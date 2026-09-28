@@ -11,7 +11,7 @@ from einops import rearrange
 import peft
 
 from models.base import ComfyPipeline, load_runtime_adapters, make_contiguous, tokenize
-from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, is_main_process
+from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, is_main_process, get_t_distribution, slice_t_distribution, sample_t
 from utils.offloading import ModelOffloader
 import comfy.ldm.common_dit
 from comfy.ldm.flux.layers import timestep_embedding
@@ -209,6 +209,21 @@ class Krea2Pipeline(ComfyPipeline):
         elif self.model_config.get('flux_shift', False):
             mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
             t = time_shift(mu, 1.0, t)
+
+        # Optional noise band (same min_t/max_t convention as Wan 2.2 high/low noise): truncate the shifted
+        # distribution to [min_t, max_t), e.g. min_t = 0.9 trains only the high-noise steps where Krea2
+        # decides composition (t = 1 is pure noise).
+        min_t = self.model_config.get('min_t', 0.0)
+        max_t = self.model_config.get('max_t', 1.0)
+        if (min_t, max_t) != (0.0, 1.0):
+            t_dist = get_t_distribution(self.model_config)
+            if shift:
+                t_dist = (t_dist * shift) / (1 + (shift - 1) * t_dist)
+            elif self.model_config.get('flux_shift', False):
+                t_dist = time_shift(mu, 1.0, t_dist)
+            t_dist = slice_t_distribution(t_dist, min_t=min_t, max_t=max_t)
+            assert len(t_dist) > 0, f'no timesteps left in [min_t={min_t}, max_t={max_t})'
+            t = sample_t(t_dist, bs, quantile=timestep_quantile).to(device)
 
         noise = torch.randn_like(latents)
         t_expanded = t.view(-1, 1, 1, 1)
