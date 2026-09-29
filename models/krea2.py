@@ -76,6 +76,14 @@ class Krea2Pipeline(ComfyPipeline):
         # frozen krea2 LoRAs get their txtfusion/txtmlp keys matched, not just the blocks.
         load_runtime_adapters(self.lora_model, target_model, target_linear_modules, adapter_config)
 
+        # Slider training (model.slider_from_mask): the trainable adapter's strength is set per
+        # micro-batch from a per-image value. Keep each LoRA module's base scaling to multiply.
+        self.slider_modules = []
+        for module in target_model.modules():
+            scaling = getattr(module, 'scaling', None)
+            if isinstance(scaling, dict) and 'default' in scaling:
+                self.slider_modules.append((module, scaling['default']))
+
     def get_call_vae_fn(self, vae):
         # The krea2 VAE is the qwen-image VAE — a 3D/temporal VAE (comfy latent_dim==3). Comfy's
         # VAE.encode turns a 4D image batch (b,c,h,w) into ONE b-frame clip (batch axis -> temporal),
@@ -144,6 +152,7 @@ class Krea2Pipeline(ComfyPipeline):
     def to_layers(self):
         diffusion_model = self.diffusion_model
         layers = [InitialLayer(diffusion_model)]
+        layers[0].slider_modules = getattr(self, 'slider_modules', [])
         for i, block in enumerate(diffusion_model.blocks):
             layers.append(TransformerLayer(block, i, self.offloader))
         layers.append(FinalLayer(diffusion_model))
@@ -230,6 +239,16 @@ class Krea2Pipeline(ComfyPipeline):
         noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
         target = noise - latents
 
+        # Slider training: each image's mask is a CONSTANT grey whose value v in [0, 1] encodes the
+        # LoRA strength s = 2v - 1 in [-1, 1] (reuses the mask plumbing through the latent cache).
+        # The mask is then dropped (unweighted loss); s rides along as an extra input and
+        # InitialLayer applies it to every trainable LoRA module before the forward.
+        if self.model_config.get('slider_from_mask', False):
+            assert mask is not None, 'slider_from_mask needs a mask for every image'
+            assert bs == 1, 'slider_from_mask needs micro_batch_size_per_gpu = 1 (one strength per forward)'
+            slider = (2 * mask.float().mean(dim=(1, 2, 3)) - 1).to(device)
+            return (noisy_latents, t, text_embeds, text_attention_mask, slider), (target, None)
+
         return (noisy_latents, t, text_embeds, text_attention_mask), (target, mask)
 
     def enable_block_swap(self, blocks_to_swap):
@@ -270,6 +289,7 @@ class InitialLayer(nn.Module):
         self.txtmlp = model.txtmlp
         self.pe_embedder = model.pe_embedder
         self.model = [model]
+        self.slider_modules = []
 
     def __getattr__(self, name):
         return getattr(self.model[0], name)
@@ -279,6 +299,17 @@ class InitialLayer(nn.Module):
         for item in inputs:
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
+        if len(inputs) == 5:
+            # Slider training (see Krea2Pipeline.prepare_inputs). Set here, inside the forward, so it
+            # always matches the micro-batch being computed (incl. activation-checkpoint recompute).
+            *inputs, slider = inputs
+            s = float(slider.flatten()[0])
+            assert self.slider_modules, 'slider_from_mask: no trainable LoRA modules found'
+            for module, base in self.slider_modules:
+                module.scaling['default'] = base * s
+            if getattr(self, '_slider_logged', 0) < 5:
+                self._slider_logged = getattr(self, '_slider_logged', 0) + 1
+                print(f'[slider] strength {s:+.3f} on {len(self.slider_modules)} LoRA modules')
         x, timesteps, context, text_mask = inputs
 
         bs, c, H_orig, W_orig = x.shape
