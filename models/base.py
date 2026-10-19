@@ -951,7 +951,9 @@ class ComfyPipeline(CommonPipeline):
         # works for both images (b c h w) and video (b c f h w)
         img = img.movedim(1, -1)
         latents = self.vae.encode(img)
-        latents = self.latent_format.process_in(latents)
+        if self.latent_format is not None:
+            # models without one (krea2, qwen_image21) apply process_latent_in in prepare_inputs
+            latents = self.latent_format.process_in(latents)
         return latents
 
     def vae_decode(self, latents):

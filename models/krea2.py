@@ -10,7 +10,7 @@ from einops import rearrange
 
 import peft
 
-from models.base import ComfyPipeline, load_runtime_adapters, make_contiguous, tokenize
+from models.base import ComfyPipeline, load_runtime_adapters, make_contiguous
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, is_main_process, get_t_distribution, slice_t_distribution, sample_t
 from utils.offloading import ModelOffloader
 import comfy.ldm.common_dit
@@ -95,8 +95,7 @@ class Krea2Pipeline(ComfyPipeline):
         def fn(images):
             images = images.to('cuda')
             images = images.movedim(1, -1)    # (b,c,h,w) -> (b,h,w,c)
-            images = images.unsqueeze(1)      # -> (b,1,h,w,c): one 1-frame clip per image
-            images = (images + 1) / 2         # comfy expects pixels in [0,1]
+            images = images.unsqueeze(1)      # -> (b,1,h,w,c): one 1-frame clip per image (pixels already [0,1])
             latents = vae.encode(images)      # comfy VAE.encode -> (b,c,1,h,w), kept 5D
             return {'latents': latents}
         return fn
@@ -120,7 +119,7 @@ class Krea2Pipeline(ComfyPipeline):
 
             max_length = 0
             for text in captions:
-                tokens = tokenize(text_encoder, text)
+                tokens = text_encoder.tokenize(text)
                 for v in tokens.values():
                     max_length = max(max_length, len(v[0]))
 
@@ -129,7 +128,7 @@ class Krea2Pipeline(ComfyPipeline):
             tokenizer.min_length = max_length
             tokens_dict = defaultdict(list)
             for text in captions:
-                tokens = tokenize(text_encoder, text)
+                tokens = text_encoder.tokenize(text)
                 for k, v in tokens.items():
                     tokens_dict[k].extend(v)
 

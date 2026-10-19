@@ -126,7 +126,10 @@ comfy.ldm.minimax.model.AdalnProj = AdalnProj
 
 class DiTBlock(nn.Module):
     def __init__(self, hidden, heads, head_dim, ffn, t_dim, eps, qk_eps,
-                 apply_silu=True, adaln_dtype=None, dtype=None, device=None, operations=None):
+                 apply_silu=True, adaln_dtype=None, gate_compress=False, dtype=None, device=None, operations=None):
+        # gate_compress (ComfyUI c194dd00+): VSA sparse-attention gate, only present in VSA-trained
+        # checkpoints and unused by the dense forward -> accepted and ignored
+        del gate_compress
         super().__init__()
         self.norm1 = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
         self.norm2 = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
