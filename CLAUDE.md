@@ -57,14 +57,20 @@ Do **not** treat these other on-disk clones as authoritative:
 - `/home/misw/venv/finetune/diffusion-pipe` — upstream tdrussell, not the fork.
 
 ### Branch layout
-- `feature-krea2` — **current.** krea2 model support (off `feature-xlasm-frozen`).
+- `feature-mmh3` — **current** (pushed 698dab0, 2026-10-19). `feature-krea2` + 42 upstream
+  cherry-picks (MiniMax H3, LoKr/CommonPipeline refactor, quantized-Comfy training, …) + the
+  krea2 text-template caching fix + the minimax_h3 `gate_compress` fix. Verified on the local
+  vast replica (`vt`, compose service `vasttrain`): krea2 + H3 both train.
+- `feature-krea2` — krea2 model support (off `feature-xlasm-frozen`). **Has the 1-token text
+  embedding caching bug** — do not train krea2 from it.
 - `feature-xlasm-frozen` — single-file ComfyUI-format runtime_adapter support
   (reads safetensors directly, derives rank, builds synthetic `LoraConfig`,
   `add_adapter` + `load_state_dict`).
 - `main` — tracks upstream-ish base.
 
 `000_install/aitools.sh` `REPOS_TRAINER_BRANCH` selects which branch
-`train_install` clones + which ComfyUI submodule commit gets pulled.
+`train_install` clones + which ComfyUI submodule commit gets pulled. (Set to `feature-mmh3`
+on 2026-10-19.)
 
 ---
 
