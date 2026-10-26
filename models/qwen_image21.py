@@ -196,19 +196,24 @@ class QwenImage21Pipeline(ComfyPipeline):
 
             tokenizer.min_length = 1
             max_length = 0
+            # The tokenizer output also carries the scalar `keep_vision` flag next to the token lists.
             for text in captions:
-                tokens = text_encoder.tokenizer.tokenize_with_weights(text)
+                tokens = text_encoder.tokenizer.tokenize_with_weights(text, prevent_empty_text=True)
                 for v in tokens.values():
-                    max_length = max(max_length, len(v[0]))
+                    if isinstance(v, list):
+                        max_length = max(max_length, len(v[0]))
 
             # Pad to max length in the batch ourselves, or the ComfyUI backend concats
             # variable-length tensors and fails.
             tokenizer.min_length = max_length
             tokens_dict = defaultdict(list)
             for text in captions:
-                tokens = text_encoder.tokenizer.tokenize_with_weights(text)
+                tokens = text_encoder.tokenizer.tokenize_with_weights(text, prevent_empty_text=True)
                 for k, v in tokens.items():
-                    tokens_dict[k].extend(v)
+                    if isinstance(v, list):
+                        tokens_dict[k].extend(v)
+                    else:
+                        tokens_dict[k] = v
 
             o = text_encoder.encode_from_tokens_scheduled(tokens_dict)
 
