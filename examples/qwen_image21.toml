@@ -38,6 +38,8 @@ dtype = 'bfloat16'
 timestep_sample_method = 'logit_normal'
 flux_shift = true   # model's own resolution-dependent schedule (mu 0.5 @ 256 tokens -> 0.9 @ 8192)
 #shift = 2.0        # fixed alternative == ComfyUI's mu 0.69 at 1024x1024 (multiplicative form here)
+# Edit datasets (control_path): reference size for the text encoder, == the ComfyUI node's `resolution`.
+#edit_resolution = 1024
 
 [adapter]
 type = 'lora'

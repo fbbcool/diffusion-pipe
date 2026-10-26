@@ -1,11 +1,14 @@
 import os
 import sys
+import math
 from collections import defaultdict
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
 import torch
 from torch import nn
 import torch.nn.functional as F
+import numpy as np
+from PIL import Image
 
 import peft
 
@@ -13,6 +16,7 @@ from models.base import ComfyPipeline, load_runtime_adapters, make_contiguous
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, is_main_process
 from utils.offloading import ModelOffloader
 import comfy.ldm.qwen_image21.model as qi21_model
+import comfy.utils
 from comfy.ldm.modules.attention import optimized_attention
 
 
@@ -37,6 +41,14 @@ from comfy.ldm.modules.attention import optimized_attention
 #     tokens excluded as keys, and give the image block its RoPE start position from each
 #     caption's TRUE length (not the padded one) to keep train == inference positions.
 #   - The inference-only prefix K/V cache is never touched (we drive the blocks directly).
+#
+# Edit training (dataset `control_path` = source images, stem-matched to the targets): mirrors the
+# TextEncodeQwenImage21 node with one reference image. The text encoder sees the source (resized to
+# ~edit_resolution^2 at multiples of 32, like the node) and drops its vision tokens, recording the
+# slot where the image sat; the source's VAE latents are spliced in at that slot:
+# [text[:slot], ref, text[slot:], target]. Text and reference rows form the t = 0 prefix, only the
+# target is noised and supervised. The reference is VAE-encoded at the target's bucket size, so
+# ref size == target size, as at inference (the node sizes the target latent to the first ref).
 
 
 def _gated_residual_out_of_place(x, y, gate, prefix_len):
@@ -70,6 +82,8 @@ class QwenImage21Pipeline(ComfyPipeline):
     adapter_target_names = ['txt_in', 'img_in']
     # Kept in bf16 when diffusion_model_dtype='float8' (the block linears are what gets quantized).
     keep_in_high_precision = ['txt_in', 'img_in', 'time_text_embed', 'modulation', 'norm_out', 'proj_out']
+    # TextEncodeQwenImage21 sizes reference images (and so the edit target) at multiples of 32.
+    pixels_round_to_multiple = 32
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -110,7 +124,34 @@ class QwenImage21Pipeline(ComfyPipeline):
 
     # VAE: the 2.1 VAE is a 2D-latent (no frame axis) 16x RGBA autoencoder. comfy's VAE.encode takes
     # (b, h, w, c) RGB in [0, 1] and pads alpha = 1 itself, returning (b, 64, h/16, w/16) — the
-    # ComfyPipeline default get_call_vae_fn already does exactly that, so it is not overridden.
+    # ComfyPipeline default VAE fn does exactly that; edit datasets additionally encode the source.
+    def get_call_vae_fn(self, vae):
+        parent_vae_fn = super().get_call_vae_fn(vae)
+
+        def fn(tensor, control_tensor=None):
+            result = parent_vae_fn(tensor)
+            if control_tensor is not None:
+                result['control_latents'] = parent_vae_fn(control_tensor)['latents']
+            return result
+        return fn
+
+    def _load_reference_image(self, path):
+        # TextEncodeQwenImage21's resize: ~resolution^2 pixels, aspect kept, multiples of 32, lanczos;
+        # the vision tower sees alpha composited over white.
+        resolution = self.model_config.get('edit_resolution', 1024)
+        img = Image.open(path)
+        img = img.convert('RGBA') if img.mode in ('RGBA', 'LA', 'P') else img.convert('RGB')
+        image = torch.from_numpy(np.array(img).astype(np.float32) / 255.0)[None]  # (1, H, W, C)
+        samples = image.movedim(-1, 1)
+        ratio = samples.shape[3] / samples.shape[2]
+        width = max(32, round(math.sqrt(resolution * resolution * ratio) / 32) * 32)
+        height = max(32, round(math.sqrt(resolution * resolution / ratio) / 32) * 32)
+        if (width, height) != (samples.shape[3], samples.shape[2]):
+            image = comfy.utils.common_upscale(samples, width, height, 'lanczos', 'disabled').movedim(1, -1)
+        rgb = image[..., :3]
+        if image.shape[-1] > 3:
+            rgb = rgb * image[..., 3:] + (1.0 - image[..., 3:])
+        return rgb
 
     def get_call_text_encoder_fn(self, text_encoder):
         # Differs from ComfyPipeline.get_call_text_encoder_fn in two ways:
@@ -131,7 +172,26 @@ class QwenImage21Pipeline(ComfyPipeline):
             raise RuntimeError('Unknown text encoder')
 
         @torch.inference_mode()
-        def fn(captions: list[str], is_video: list[bool]):
+        def fn(captions: list[str], is_video: list[bool], control_file: list[str] | None):
+            if control_file is not None:
+                # Edit pairs: one caption per encode call, because the TE reports the image slot for
+                # the whole call. No padding needed; the cache stores variable-length rows anyway.
+                embeds, masks, slots = [], [], []
+                for text, path in zip(captions, control_file):
+                    tokens = text_encoder.tokenizer.tokenize_with_weights(text, images=[self._load_reference_image(path)], prevent_empty_text=True)
+                    o = text_encoder.encode_from_tokens_scheduled(tokens)
+                    text_embeds, extra = o[0][0][0], o[0][1]
+                    image_slots = extra.get('image_slots', [])
+                    assert len(image_slots) == 1, f'expected one image slot, got {image_slots}'
+                    embeds.append(text_embeds)
+                    masks.append(torch.ones(text_embeds.shape[0], dtype=torch.bool, device=text_embeds.device))
+                    slots.append(torch.tensor([image_slots[0]], dtype=torch.int64))
+                return {
+                    f'text_embeds_{te_idx}': embeds,
+                    f'attention_mask_{te_idx}': masks,
+                    f'image_slot_{te_idx}': slots,
+                }
+
             tokenizer = getattr(text_encoder.tokenizer, text_encoder.tokenizer.clip)
 
             tokenizer.min_length = 1
@@ -160,6 +220,8 @@ class QwenImage21Pipeline(ComfyPipeline):
             return {
                 f'text_embeds_{te_idx}': text_embeds,
                 f'attention_mask_{te_idx}': attention_mask,
+                # -1 = no reference image (T2I captions, and the uncond caption)
+                f'image_slot_{te_idx}': torch.full((len(captions), 1), -1, dtype=torch.int64),
             }
 
         return fn
@@ -192,6 +254,20 @@ class QwenImage21Pipeline(ComfyPipeline):
 
         bs, c, h, w = latents.shape
         device = latents.device
+
+        if 'control_latents' in inputs:
+            ref_latents = self.model_patcher.model.process_latent_in(inputs['control_latents'].float())
+            assert ref_latents.shape == latents.shape, f'reference latents {tuple(ref_latents.shape)} != target latents {tuple(latents.shape)}'
+            image_slot = inputs.get('image_slot_0')
+            if image_slot is None:
+                raise RuntimeError('Edit dataset but the text embedding cache has no image slots; re-cache with --regenerate_cache')
+            image_slot = (torch.stack(image_slot) if isinstance(image_slot, list) else image_slot).view(bs).to(device)
+            if (image_slot < 0).any():
+                # the uncond caption is cached once, without a source image, so it has no slot
+                raise NotImplementedError('uncond_fraction is not supported for Qwen-Image 2.1 edit datasets')
+        else:
+            ref_latents = latents.new_zeros((bs, c, 0, 0))
+            image_slot = torch.full((bs,), -1, dtype=torch.int64, device=device)
 
         if mask is not None:
             mask = mask.unsqueeze(1)  # make mask (bs, 1, img_h, img_w)
@@ -231,7 +307,7 @@ class QwenImage21Pipeline(ComfyPipeline):
         noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
         target = noise - latents
 
-        return (noisy_latents, t, text_embeds, text_attention_mask), (target, mask)
+        return (noisy_latents, t, text_embeds, text_attention_mask, ref_latents, image_slot), (target, mask)
 
     def enable_block_swap(self, blocks_to_swap):
         diffusion_model = self.diffusion_model
@@ -279,53 +355,79 @@ class InitialLayer(nn.Module):
         for item in inputs:
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
-        x, timesteps, context, text_mask = inputs
+        x, timesteps, context, text_mask, ref, image_slot = inputs
 
         bs, c, H, W = x.shape
         device = x.device
         dtype = AUTOCAST_DTYPE
+        has_ref = ref.shape[-1] > 0
 
-        # Mirrors QwenImage21Transformer2DModel.build_sequence for the no-reference case:
-        # sequence = [text, image], image tokens in raster order (patch size 1, no padding needed).
+        # Mirrors QwenImage21Transformer2DModel.build_sequence with at most one reference:
+        # sequence = [text[:slot], ref, text[slot:], target], images in raster order (patch size 1).
+        # Without a reference, slot = the (padded) text length, i.e. [text, target]. Right-padding
+        # sits at the end of text[slot:], so one slot works for the whole batch.
         txt = self.txt_in(context)
-        img = self.img_in(x.flatten(2).transpose(1, 2))
-        hidden_states = torch.cat([txt, img], dim=1)
         txt_len = txt.shape[1]
+        if has_ref:
+            assert (image_slot == image_slot[0]).all(), f'image slots differ across the batch: {image_slot.tolist()}'
+            slot = int(image_slot[0])
+            h, w = ref.shape[-2:]
+            ref_len = h * w
+            hidden_states = torch.cat([txt[:, :slot], self.img_in(ref.flatten(2).transpose(1, 2)), txt[:, slot:], self.img_in(x.flatten(2).transpose(1, 2))], dim=1)
+        else:
+            slot, h, w, ref_len = txt_len, 0, 0, 0
+            hidden_states = torch.cat([txt, self.img_in(x.flatten(2).transpose(1, 2))], dim=1)
         img_len = H * W
-        N = txt_len + img_len
+        prefix_len = txt_len + ref_len
+        N = prefix_len + img_len
+        ref_extent = max(h, w)  # RoPE axis-0 positions a reference block occupies
 
-        # 3-axis RoPE ids. Text tokens count 0..txt_len-1 on all axes. The image block starts
-        # (axis 0) at the caption's TRUE token count, which is where inference puts it; pad tokens
-        # keep counting but are masked out below. Image rows/cols are centred like comfy does.
-        txt_ids = torch.arange(txt_len, device=device, dtype=torch.float32).unsqueeze(1).expand(txt_len, 3)
-        hh = torch.arange(H, device=device, dtype=torch.float32) - (H - H // 2)
-        ww = torch.arange(W, device=device, dtype=torch.float32) - (W - W // 2)
-        img_hw = torch.stack([hh[:, None].expand(H, W), ww[None, :].expand(H, W)], dim=-1).flatten(0, 1)  # (HW, 2)
+        def image_hw(h, w):
+            # rows/cols centred like comfy, with half a token where the grid has the other parity than the target
+            hh = torch.arange(h, device=device, dtype=torch.float32) - (h - h // 2) + 0.5 * (h % 2 - H % 2)
+            ww = torch.arange(w, device=device, dtype=torch.float32) - (w - w // 2) + 0.5 * (w % 2 - W % 2)
+            return torch.stack([hh[:, None].expand(h, w), ww[None, :].expand(h, w)], dim=-1).flatten(0, 1)
+
+        # 3-axis RoPE ids. Text counts on all axes; a reference block sits at one axis-0 position and
+        # advances the count by max(h, w). The target block starts (axis 0) after the caption's TRUE
+        # token count, which is where inference puts it; pad tokens keep counting but are masked out.
+        ids_a = torch.arange(slot, device=device, dtype=torch.float32).unsqueeze(1).expand(slot, 3)
+        ids_ref = torch.cat([torch.full((ref_len, 1), float(slot), device=device), image_hw(h, w)], dim=-1)
+        ids_b = (slot + ref_extent + torch.arange(txt_len - slot, device=device, dtype=torch.float32)).unsqueeze(1).expand(txt_len - slot, 3)
+        img_hw = image_hw(H, W)
         txt_true_len = text_mask.sum(dim=1)
         ids = []
         for i in range(bs):
-            img_pos = torch.full((img_len, 1), float(txt_true_len[i]), device=device, dtype=torch.float32)
-            ids.append(torch.cat([txt_ids, torch.cat([img_pos, img_hw], dim=-1)], dim=0))
+            img_pos = torch.full((img_len, 1), float(txt_true_len[i] + ref_extent), device=device, dtype=torch.float32)
+            ids.append(torch.cat([ids_a, ids_ref, ids_b, torch.cat([img_pos, img_hw], dim=-1)], dim=0))
         ids = torch.stack(ids, dim=0)  # (bs, N, 3)
         # EmbedND -> (bs, 1, N, ...); comfy transposes to (bs, N, 1, ...) for its (B, N, H, D) q/k layout.
         pe = self.pe_embedder(ids).transpose(1, 2).contiguous()
 
         # Timestep -> shared modulation. Row order matches comfy: [t_0 .. t_{bs-1}, 0]; the last
-        # (t = 0) row modulates the text prefix, the others the image rows of their batch element.
+        # (t = 0) row modulates the prefix (text + reference), the others the target rows.
         t = ((timesteps * 1000).to(dtype) / 1000).to(dtype)
         temb = self.time_text_embed(torch.cat([t, t.new_zeros(1)]), dtype)  # (bs + 1, D)
         mod = self.modulation(temb)  # (bs + 1, 4D)
 
         # Block-causal attention mask with padding: (bs, 1, N, N) bool, True = may attend.
-        #   text query i  -> text keys j <= i that are real tokens
-        #   image query   -> all real text keys + all image keys
-        key_valid = torch.cat([text_mask, torch.ones((bs, img_len), dtype=torch.bool, device=device)], dim=1)  # (bs, N)
-        attn_mask = key_valid[:, None, :].expand(bs, N, N).clone()
-        attn_mask[:, :txt_len, :txt_len] &= torch.ones((txt_len, txt_len), dtype=torch.bool, device=device).tril()
-        attn_mask[:, :txt_len, txt_len:] = False
+        # Query q sees key k iff k < limit[q] and k is not a pad token, where limit is q + 1 for text
+        # (causal over everything before it, reference included), the block end for the reference,
+        # and N for the target — comfy's segments.
+        idx = torch.arange(N, device=device)
+        limit = idx + 1
+        limit[slot:slot + ref_len] = slot + ref_len
+        limit[prefix_len:] = N
+        key_valid = torch.cat([
+            text_mask[:, :slot],
+            torch.ones((bs, ref_len), dtype=torch.bool, device=device),
+            text_mask[:, slot:],
+            torch.ones((bs, img_len), dtype=torch.bool, device=device),
+        ], dim=1)  # (bs, N)
+        attn_mask = (idx[None, :] < limit[:, None])[None] & key_valid[:, None, :]
         attn_mask = attn_mask.unsqueeze(1)
 
-        sizes = torch.tensor([txt_len, H, W], device=device)
+        sizes = torch.tensor([prefix_len, H, W], device=device)
 
         outputs = make_contiguous(hidden_states, pe, mod, temb, attn_mask, sizes)
         for item in outputs:
@@ -344,7 +446,7 @@ class TransformerLayer(nn.Module):
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         hidden_states, pe, mod, temb, attn_mask, sizes = inputs
-        txt_len = int(sizes[0])
+        prefix_len = int(sizes[0])
 
         # Same unpacking as QwenImage21Transformer2DModel._forward. The trailing `zero` entry is
         # only consumed by the fused inference kernels, which `in_training` bypasses.
@@ -358,7 +460,7 @@ class TransformerLayer(nn.Module):
         )
 
         self.offloader.wait_for_block(self.block_idx)
-        hidden_states = self.block(hidden_states, block_mod, pe, _masked_attention(attn_mask), txt_len)
+        hidden_states = self.block(hidden_states, block_mod, pe, _masked_attention(attn_mask), prefix_len)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
         return make_contiguous(hidden_states, pe, mod, temb, attn_mask, sizes)
@@ -377,9 +479,9 @@ class FinalLayer(nn.Module):
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         hidden_states, pe, mod, temb, attn_mask, sizes = inputs
-        txt_len, H, W = sizes.tolist()
+        prefix_len, H, W = sizes.tolist()
         bs = hidden_states.shape[0]
 
-        out = self.norm_out(hidden_states[:, txt_len:], temb[:-1])
+        out = self.norm_out(hidden_states[:, prefix_len:], temb[:-1])
         out = self.proj_out(out)
         return out.transpose(1, 2).reshape(bs, self.out_channels, H, W)

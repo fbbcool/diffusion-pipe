@@ -613,8 +613,20 @@ and masked loss work as for the other models.
 
 Prompts are encoded with the model's chat template exactly as ComfyUI does at inference. The
 text encoder is 17.5 GB in bf16; caching text embeddings is done before training, so it is not
-resident during the training loop. Images are resized to multiples of 16 pixels (one latent
-pixel = 16 image pixels, patch size 1).
+resident during the training loop. Images are resized to multiples of 32 pixels (one latent
+pixel = 16 image pixels, patch size 1; 32 matches how ComfyUI sizes edit references).
+
+**Edit training.** Give the `[[directory]]` a `control_path` with the source images, matched to
+the target images by file stem (see `examples/qwen_image21_edit_dataset.toml`); the caption is the
+edit instruction. This reproduces ComfyUI's `TextEncodeQwenImage21` node with one reference image:
+the text encoder sees the source (resized to about `edit_resolution`² pixels at multiples of 32,
+`edit_resolution` in `[model]`, default 1024, like the node's `resolution`), and the source's VAE
+latents are spliced into the sequence at the image's slot in the prompt, modulated at t = 0 with
+the text. The source is VAE-encoded at the target's bucket size, so source and target must be the
+same size and aspect ratio; the node also sizes the output to the reference. Use `ar_buckets` with
+the exact sizes the node produces (e.g. 1024x1024, 832x1248, 1248x832) so training sees the same
+sizes as inference. `uncond_fraction` is not supported for edit datasets. T2I directories can be
+trained at the same time.
 
 ## LTX 2.3
 ```

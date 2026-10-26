@@ -1,0 +1,16 @@
+# Qwen-Image 2.1 edit dataset: target images + captions (the edit instruction) in `path`, the
+# source images with the same file stems in `control_path`. See docs/supported_models.md#qwen-image-21.
+resolutions = [1024]
+
+# Exact sizes ComfyUI's TextEncodeQwenImage21 gives a reference at resolution 1024 (about 1024^2
+# pixels, multiples of 32), so training sees the same sizes as inference.
+enable_ar_bucket = true
+ar_buckets = [[1024, 1024], [832, 1248], [1248, 832]]
+
+num_repeats = 1
+
+[[directory]]
+path = '/data/edit_pairs/target'
+control_path = '/data/edit_pairs/source'
+# Optional loss mask (white = edit region, grey = partial weight, black = ignored), stem-matched.
+#mask_path = '/data/edit_pairs/mask'

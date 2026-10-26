@@ -4,6 +4,8 @@
 #   3. LoRA backward through the split: every lora_B gets gradient at step 1, every lora_A at step 2
 #   3b. shows why comfy's in-place _gated_residual is patched (fp32 autograd error)
 #   4. comfy VAE detection + encode path for the 2.1 VAE layout: (b, h, w, 3) -> (b, 64, h/16, w/16)
+#   5. edit path: reference spliced at its image slot == comfy _forward(ref_latents, image_slots),
+#      unpadded and right-padded; odd/even ref-vs-target parity; LoRA grads with a reference
 # Run from the repo root with a venv that has torch/peft + the ComfyUI submodule requirements
 # (comfy-kitchen, comfy-aimdo, scipy, pyyaml, av, aiohttp, yarl):
 #   python test/test_qwen_image21.py            # CPU, exact
@@ -46,8 +48,11 @@ class Dummy:
 def chain(m):
     return [pipe.InitialLayer(m)] + [pipe.TransformerLayer(b, i, Dummy()) for i, b in enumerate(m.transformer_blocks)] + [pipe.FinalLayer(m)]
 
-def run_chain(layers, x, t, ctx, mask):
-    inputs = (x, t, ctx, mask)
+def run_chain(layers, x, t, ctx, mask, ref=None, slot=None):
+    bs = x.shape[0]
+    if ref is None:
+        ref, slot = x.new_zeros((bs, x.shape[1], 0, 0)), torch.full((bs,), -1, dtype=torch.int64, device=x.device)
+    inputs = (x, t, ctx, mask, ref, slot)
     for l in layers: inputs = l(inputs)
     return inputs
 
@@ -126,4 +131,37 @@ img = torch.rand(2, 32, 48, 3)
 with torch.no_grad(): lat = vae.encode(img)
 print('4 vae.encode', tuple(img.shape), '->', tuple(lat.shape))
 assert tuple(lat.shape) == (2, 64, 2, 3)
+
+# (5) edit path: one reference at slot S, compared to comfy's build_sequence/_forward per sample
+def comfy_fwd(*a, **k):
+    return m._forward(*a, **k) if dev.type=='cpu' else torch.autocast('cuda', dtype=torch.bfloat16)(m._forward)(*a, **k)
+m = build(1)
+layers = chain(m)
+S = 3
+for (h, w) in [(H, W), (4, 7)]:  # same size as the target (training case) and other parity on both axes
+    ref_lat = torch.randn(B, C, h, w, device=dev)
+    slot = torch.full((B,), S, dtype=torch.int64, device=dev)
+    with torch.no_grad():
+        out5 = run_chain(layers, x, t, ctx, mask, ref_lat, slot)
+        for i in range(B):
+            r = comfy_fwd(x[i:i+1], t[i:i+1], ctx[i:i+1], ref_latents=[ref_lat[i:i+1]], image_slots=[S])
+            d = (out5[i:i+1] - r).abs().max().item()
+            print(f'5 ref {h}x{w} unpadded sample {i} max|diff| =', d)
+            assert d < TOL
+        # padded batch (pads after the slot, at the end of text[slot:])
+        out6 = run_chain(layers, x, t, ctx2, mask2, ref_lat, slot)
+        for i, n in enumerate(lens):
+            r = comfy_fwd(x[i:i+1], t[i:i+1], ctx2[i:i+1, :n], ref_latents=[ref_lat[i:i+1]], image_slots=[S])
+            d = (out6[i:i+1] - r).abs().max().item()
+            print(f'5 ref {h}x{w} padded sample {i} (len {n}) max|diff| =', d)
+            assert d < TOL
+        # the reference must actually condition the output
+        out7 = run_chain(layers, x, t, ctx, mask, ref_lat + 1.0, slot)
+        assert (out7 - out5).abs().max().item() > 1e-3
+lm = peft.get_peft_model(m, peft.LoraConfig(r=4, lora_alpha=4, target_modules=sorted(targets)))
+out8 = run_chain(chain(m), x, t, ctx2, mask2, torch.randn(B, C, H, W, device=dev), torch.full((B,), S, dtype=torch.int64, device=dev))
+((out8 - torch.randn_like(out8)) ** 2).mean().backward()
+zero8 = [n for n, p in m.named_parameters() if p.requires_grad and p.grad.abs().sum().item() == 0]
+assert all('lora_A' in n for n in zero8) and not any('lora_B' in n for n in zero8), zero8
+print('5 edit LoRA step1: lora_B all nonzero')
 print('ALL OK')
