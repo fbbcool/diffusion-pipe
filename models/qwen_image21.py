@@ -272,6 +272,10 @@ class QwenImage21Pipeline(ComfyPipeline):
         if mask is not None:
             mask = mask.unsqueeze(1)  # make mask (bs, 1, img_h, img_w)
             mask = F.interpolate(mask, size=(h, w), mode='nearest-exact')  # resize to latent spatial dimension
+            # Loss weight outside the mask (0 = ignored). Edit masks cover a few % of the image, so a
+            # small floor keeps the copied background / seams anchored without drowning the edit.
+            if mask_floor := self.model_config.get('mask_floor', 0.0):
+                mask = mask_floor + (1 - mask_floor) * mask
 
         timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
 

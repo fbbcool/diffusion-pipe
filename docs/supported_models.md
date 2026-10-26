@@ -628,6 +628,10 @@ the exact sizes the node produces (e.g. 1024x1024, 832x1248, 1248x832) so traini
 sizes as inference. `uncond_fraction` is not supported for edit datasets. T2I directories can be
 trained at the same time.
 
+`mask_floor` in `[model]` (default 0) sets the loss weight outside a `mask_path` mask: with binary
+edit-region masks, 0 trains only the edit region, small values (e.g. 0.1) also anchor the copied
+background.
+
 ## LTX 2.3
 ```
 [model]
