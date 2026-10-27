@@ -17,7 +17,7 @@ from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, is_main_p
 from utils.offloading import ModelOffloader
 import comfy.ldm.qwen_image21.model as qi21_model
 import comfy.utils
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
 
 
 # Qwen-Image 2.1 is NOT an update of Qwen-Image: it's a new 7B single-stream DiT
@@ -66,7 +66,9 @@ qi21_model._gated_residual = _gated_residual_out_of_place
 def _masked_attention(attn_mask):
     # Replaces comfy's `block_causal_attention` closure: one SDPA over the whole sequence with an
     # explicit (bs, 1, N, N) bool mask (True = may attend) that encodes block-causality AND padding.
+    # comfy >= 2026-10 hands q/k/v over as single-owner AttentionTensorContainers.
     def attn(q, k, v, heads, preferred_attention=None):
+        q, k, v = (t.take() if isinstance(t, AttentionTensorContainer) else t for t in (q, k, v))
         return optimized_attention(q.flatten(2), k.flatten(2), v.flatten(2), heads, mask=attn_mask, preferred_attention=preferred_attention)
     return attn
 
