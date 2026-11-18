@@ -10,6 +10,7 @@ from models.base import ComfyPipeline, make_contiguous
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift
 from utils.offloading import ModelOffloader
 import comfy.latent_formats
+import comfy.ldm.flux.math
 from comfy.ldm.flux.layers import timestep_embedding
 import comfy.ldm.moss_image.model
 from comfy.ldm.moss_image.model import modulated_rms_norm, rope_split_half, situ, gated_residual
@@ -124,7 +125,9 @@ def rope_per_caption(model, h, w, text_len, txt_lens, device):
     ids[:, :h * w, 2] = (torch.arange(h, device=device, dtype=torch.float32) - (h - 1) / 2).repeat_interleave(w)
     ids[:, :h * w, 3] = (torch.arange(w, device=device, dtype=torch.float32) - (w - 1) / 2).repeat(h)
     ids[:, h * w:, 1] = torch.arange(text_len, device=device, dtype=torch.float32)
-    return model.pe_embedder(ids).transpose(1, 2).contiguous()
+    # == comfy's MOSSImage.rope without rope_options scaling / refs (ComfyUI b9b290e43 dropped pe_embedder = EmbedND)
+    pe = torch.cat([comfy.ldm.flux.math.rope(ids[..., i], d, 10000) for i, d in enumerate(model.rope_axes_dim)], dim=-3)
+    return pe.unsqueeze(1).transpose(1, 2).contiguous()
 
 
 class MossImagePipeline(ComfyPipeline):

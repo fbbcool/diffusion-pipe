@@ -14,7 +14,7 @@ from utils.offloading import ModelOffloader
 import comfy.latent_formats
 import comfy.model_management
 import comfy.ldm.minimax.model
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import ComfyAttention, AttentionTensorContainer, optimized_attention
 from comfy.ldm.minimax.model import (
     PackedLayout, time_shift_sigma, VISUAL_COND_TIMESTEP, AUDIO_COND_TIMESTEP, patchify_video, pack_audio,
     rope_rotation_table, unpatchify_video, unpack_audio, MLP, AdalnProj,
@@ -68,8 +68,9 @@ comfy.ldm.minimax.model._mod_gate = _mod_gate
 
 
 class Attention(nn.Module):
-    def __init__(self, hidden, heads, head_dim, eps, dtype=None, device=None, operations=None):
+    def __init__(self, hidden, heads, head_dim, eps, gate_compress=False, dtype=None, device=None, operations=None):
         super().__init__()
+        self.comfy_attention = ComfyAttention()
         self.heads = heads
         self.head_dim = head_dim
         inner = heads * head_dim
@@ -77,13 +78,17 @@ class Attention(nn.Module):
         self.q_norm = operations.RMSNorm(head_dim, eps=eps, dtype=dtype, device=device)
         self.k_norm = operations.RMSNorm(head_dim, eps=eps, dtype=dtype, device=device)
         self.out_proj = operations.Linear(inner, hidden, bias=False, dtype=dtype, device=device)
+        self.to_gate_compress = None
+        if gate_compress:
+            # VSA gate, unused by the dense forward; consumed by sparse attention patches
+            self.to_gate_compress = operations.Linear(hidden, inner, bias=False, dtype=dtype, device=device)
 
     def forward(self, x, rope_freqs=None, attention_mask=None, transformer_options={}):
         b, s = x.shape[:2]
         q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
         v = v.view(b, s, self.heads, self.head_dim)
         if rope_freqs is not None:
-            # fused per-head RMSNorm + partial split-half rope
+            # fused per-head RMSNorm + partial split-half rope, in  on the qkv buffer
             q = q.view(b, s, self.heads, self.head_dim)
             k = k.view(b, s, self.heads, self.head_dim)
             qw = comfy.model_management.cast_to(self.q_norm.weight, device=x.device)
@@ -94,10 +99,11 @@ class Attention(nn.Module):
         else:
             q = self.q_norm(q.view(b, s, self.heads, self.head_dim))
             k = self.k_norm(k.view(b, s, self.heads, self.head_dim))
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        out = optimized_attention(q, k, v, self.heads, mask=attention_mask, skip_reshape=True, transformer_options=transformer_options)
+
+        q = AttentionTensorContainer(q.transpose(1, 2))
+        k = AttentionTensorContainer(k.transpose(1, 2))
+        v = AttentionTensorContainer(v.transpose(1, 2))
+        out = optimized_attention(q, k, v, self.heads, preferred_attention=self.comfy_attention, mask=attention_mask, skip_reshape=True, transformer_options=transformer_options)
         return self.out_proj(out)
 
 # Patch to force eager rms_rope_split_half so backward works. Even using offical methods to set 'eager' in comfy kitchen doesn't work.
@@ -127,22 +133,21 @@ comfy.ldm.minimax.model.AdalnProj = AdalnProj
 class DiTBlock(nn.Module):
     def __init__(self, hidden, heads, head_dim, ffn, t_dim, eps, qk_eps,
                  apply_silu=True, adaln_dtype=None, gate_compress=False, dtype=None, device=None, operations=None):
-        # gate_compress (ComfyUI c194dd00+): VSA sparse-attention gate, only present in VSA-trained
-        # checkpoints and unused by the dense forward -> accepted and ignored
-        del gate_compress
         super().__init__()
         self.norm1 = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
         self.norm2 = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
-        self.attn = Attention(hidden, heads, head_dim, qk_eps, dtype=dtype, device=device, operations=operations)
+        self.attn = Attention(hidden, heads, head_dim, qk_eps, gate_compress=gate_compress,
+                              dtype=dtype, device=device, operations=operations)
         self.mlp = MLP(hidden, ffn, dtype=dtype, device=device, operations=operations)
         self.adaln_proj = AdalnProj(t_dim, hidden, 6, 3, apply_silu=apply_silu,
                                     dtype=adaln_dtype if adaln_dtype is not None else dtype,
                                     device=device, operations=operations)
 
-    def forward(self, x, t_emb, mod_segments, rope_freqs, attention_mask=None, transformer_options={}):
+    def forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}, attention=None, attention_mask=None):
+        attention = self.attn if attention is None else attention
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
         h = _mod_scale_shift(self.norm1(x), shift_msa, scale_msa, mod_segments)
-        x = _mod_gate(x, gate_msa, self.attn(h, rope_freqs=rope_freqs, attention_mask=attention_mask, transformer_options=transformer_options), mod_segments)
+        x = _mod_gate(x, gate_msa, attention(h, rope_freqs=rope_freqs, transformer_options=transformer_options, attention_mask=attention_mask), mod_segments)
         h = _mod_scale_shift(self.norm2(x), shift_mlp, scale_mlp, mod_segments)
         return _mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
 
@@ -150,26 +155,59 @@ class DiTBlock(nn.Module):
 comfy.ldm.minimax.model.DiTBlock = DiTBlock
 
 
+def pdd_head_weights(head_index, pdd_steps):
+    """(B,) int head index -> (B, pdd_steps) blend weights for a PDD head bank.
+
+    A PDD bank stores head 0 as a full head and heads 1..n-1 as offsets from it (comfy _pdd_head). A training
+    sample at grid sigma k is one whole grid interval [k, k+1), i.e. head 0 + head k (just head 0 for k = 0) --
+    comfy's sampler rule for a step from grid[k] to grid[k+1], and ai-toolkit's build_pdd_grid_weights.
+    """
+    w = torch.zeros(head_index.shape[0], pdd_steps, dtype=torch.float32, device=head_index.device)
+    w[:, 0] = 1.0
+    w.scatter_(1, head_index.long().view(-1, 1), 1.0)
+    return w
+
+
 class FinalLayer(nn.Module):
-    def __init__(self, hidden, t_dim, video_dim, audio_dim, eps, apply_silu=True, adaln_dtype=None,
+    def __init__(self, hidden, t_dim, video_dim, audio_dim, eps, apply_silu=True, adaln_dtype=None, pdd_steps=1,
                  dtype=None, device=None, operations=None):
         super().__init__()
+        self.video_dim = video_dim
         self.norm = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
         self.adaln_proj = AdalnProj(t_dim, hidden, 2, 1, apply_silu=apply_silu,
                                     dtype=adaln_dtype if adaln_dtype is not None else dtype,
                                     device=device, operations=operations)
-        # output heads are the checkpoint's fp32 island; norm/adaln are stored at model dtype
-        self.video_out = operations.Linear(hidden, video_dim, bias=True, dtype=torch.float32, device=device)
-        self.audio_out = operations.Linear(hidden, audio_dim, bias=True, dtype=torch.float32, device=device)
+        # output heads are the checkpoint's fp32 island; norm/adaln are stored at model dtype.
+        # a PDD checkpoint (MiniMax-H3-Image) stacks pdd_steps heads per stream; the image model has no audio stream
+        self.video_out = operations.Linear(hidden, video_dim * pdd_steps, bias=True, dtype=torch.float32, device=device)
+        self.audio_out = None
+        if audio_dim is not None:
+            self.audio_out = operations.Linear(hidden, audio_dim * pdd_steps, bias=True, dtype=torch.float32, device=device)
 
-    def forward(self, x, t_emb, video_seg, audio_seg):
-        # video_seg / audio_seg: (start, stop, timestep_row) of the target streams
+    @property
+    def pdd_steps(self):
+        return self.video_out.weight.shape[0] // self.video_dim
+
+    def forward(self, x, t_emb, video_seg, audio_seg, head_index=None):
+        # video_seg / audio_seg: (start, stop, timestep_row) of the target streams, audio_seg None = no audio stream.
+        # head_index: (B,) PDD head per sample, required iff the checkpoint has a PDD head bank.
         shift, scale = self.adaln_proj(t_emb)
-        va, vb, vrow = video_seg
-        aa, ab, arow = audio_seg
-        hv = (self.norm(x[:, va:vb]) * (1.0 + scale[:, vrow, None]) + shift[:, vrow, None]).to(torch.float32)
-        ha = (self.norm(x[:, aa:ab]) * (1.0 + scale[:, arow, None]) + shift[:, arow, None]).to(torch.float32)
-        return self.video_out(hv), self.audio_out(ha)
+        n = self.pdd_steps
+        if n > 1 and head_index is None:
+            raise ValueError('PDD checkpoint: FinalLayer needs a per-sample head_index')
+        outs = []
+        for head, seg in ((self.video_out, video_seg), (self.audio_out, audio_seg)):
+            if seg is None:
+                continue
+            a, b, row = seg
+            h = (self.norm(x[:, a:b]) * (1.0 + scale[:, row, None]) + shift[:, row, None]).to(torch.float32)
+            out = head(h)
+            if n > 1:
+                # the bank is linear in its rows: blending the n head outputs == the blended head
+                w = pdd_head_weights(head_index, n).to(out.dtype)
+                out = torch.einsum('bsnc,bn->bsc', out.unflatten(-1, (n, -1)), w)
+            outs.append(out)
+        return outs
 
 # batch-enabled
 comfy.ldm.minimax.model.FinalLayer = FinalLayer
@@ -620,7 +658,10 @@ class InitialLayer(nn.Module):
         rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), dtype)
 
         video_seg = next((a, b, t_row[seg_t["video"]]) for a, b, k in layout.segments if k == "video")
-        audio_seg = next((a, b, t_row[seg_t["audio"]]) for a, b, k in layout.segments if k == "audio")
+        # ComfyUI >= ede4e5fe8 only packs an audio segment when audio_t > 0 (stills have none): use an empty slice,
+        # which is what the older layout's 0-row audio segment gave
+        audio_seg = next(((a, b, t_row[seg_t["audio"]]) for a, b, k in layout.segments if k == "audio"),
+                         (layout.seq_len, layout.seq_len, t_row[seg_t["audio"]]))
         # pack these as ints so we can pass as tensor between pipeline parallel layers
         mod_segments = torch.tensor(mod_segments, dtype=torch.int32, device=h.device)
         extra_ints = torch.tensor([*video_seg, *audio_seg, latent_t, lat_h, lat_w], dtype=torch.int32, device=h.device)
@@ -651,7 +692,6 @@ class InitialLayer(nn.Module):
         return outputs
 
     # TODO: will need to handle text_token_tags (and probably more) for reference images. it's all 1s for pure text prompt
-    # TODO: would be good to allow batch_size>1, but have to change a lot of this code and also pass context_mask through
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     @torch.compiler.disable
     def forward(self, inputs):

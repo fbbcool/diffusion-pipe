@@ -1,0 +1,14 @@
+# MiniMax-H3-Image dataset: images only (videos are rejected). Sides are rounded to multiples of 32 px.
+# The model is tuned for 4-20 MP output (best ~2048^2); 1024 training is the ai-toolkit default and the cheap start.
+resolutions = [1024]
+
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 9
+
+num_repeats = 1
+
+[[directory]]
+path = '/path/to/images'
+# mask_path = '/path/to/masks'  # optional masked loss, stem-matched, R channel = weight

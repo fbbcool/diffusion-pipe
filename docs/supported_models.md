@@ -28,6 +28,7 @@
 |Ideogram4       |✅    |✅              |✅                |
 |Krea 2          |✅    |✅              |✅                |
 |MiniMax H3      |✅    |✅              |✅                |
+|MiniMax-H3-Image|✅    |✅              |✅                |
 |MOSS-Image      |✅    |✅              |✅                |
 
 
@@ -711,6 +712,49 @@ cfg = 4
 There is a document for [MiniMax H3 notes](minimax_h3_notes.md). Read the whole thing before you train. Also look at the [MiniMax H3 example TOML](../examples/minimax_h3_example.toml).
 
 Everything is ComfyUI format, including the saved models. You can now train LoRAs directly on quantized models, and it is recommended to use int8 convrot (faster, better quality, and less VRAM).
+
+## MiniMax-H3-Image
+```
+[model]
+type = 'minimax_h3_image'
+diffusion_model = '/models/diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors'
+vae = '/models/vae/minimax_h3_image_vae_fp16.safetensors'
+text_encoders = [
+    {path = '/models/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors', type = 'minimax'}
+]
+dtype = 'bfloat16'
+#pdd_step_weights = [1, 1, 1, 1, 1, 1]  # optional sampling weights over the 6 training sigmas
+
+[adapter]
+type = 'lora'
+rank = 16
+dtype = 'bfloat16'
+
+[[adapter.runtime_adapters]]
+path = '/models/loras/training_adapters/minimax_h3_image_training_adapter_v1.safetensors'
+```
+MiniMax-H3-Image is the MiniMax H3 DiT without its audio stream: text-to-image on one latent frame, PDD-distilled to
+6 steps at guidance 1 (ComfyUI: euler/simple, 6 steps, cfg 1). Weights: `Comfy-Org/MiniMax-H3-Image`; the text
+encoder is the MiniMax H3 one. Needs the ComfyUI submodule at or after `ede4e5fe8`. See
+[the example TOML](../examples/minimax_h3_image.toml).
+
+- **Timesteps:** the checkpoint has 6 stacked output heads (PDD), each distilled for one interval of its own sigma
+  grid (safetensors metadata `config.transformer.pdd_sigmas`). Training draws ONLY those 6 sigmas and runs each
+  sample through its own head, like ai-toolkit. `timestep_sample_method`, `shift` and `image_shift` are ignored;
+  `pdd_step_weights` reweights the six sigmas.
+- **Distillation:** plain LoRA training de-distills the model. Train with ostris'
+  `minimax_h3_image_training_adapter_v1` (HF `ostris/minimax_h3_training_adapter`) as a frozen
+  `[[adapter.runtime_adapters]]` and leave it off at inference. `cfg > 1` (CFG-augmented training) is not
+  implemented for this model.
+- **LoRA targets:** DiT blocks + text token-refiner linears, AdaLN excluded (as for H3 video); the output heads are
+  not trained. Saved LoRAs are ComfyUI format.
+- **Data:** images only; sides rounded to 32 px. The model is tuned for 4-20 MP; 1024 training is the cheap default.
+  Latents are identical to H3 video stills (same encoder), so the image VAE or the H3 video VAE both work for caching.
+- Edit references (`<Picture n>`) are not supported yet (T2I only).
+
+Fork notes: batched captions get their image RoPE start from each caption's true token length and the token
+refiner runs on unpadded captions, so padded batches equal unpadded ComfyUI inference. Synthetic check:
+`python test/test_minimax_h3_image.py`.
 
 ## MOSS-Image
 ```

@@ -28,7 +28,7 @@ wandb
 optimum-quanto
 wheel
 ninja
-comfy-kitchen
-comfy-aimdo
+comfy-kitchen>=0.2.41  # ComfyUI submodule 0263e4880 pins 0.2.41 (older ones lack its attention/rope API)
+comfy-aimdo>=0.6.0  # ComfyUI submodule 0263e4880 pins 0.6.0
 scipy
-av>=16.0.0
+av>=17.0.0  # ComfyUI submodule 0263e4880

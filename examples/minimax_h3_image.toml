@@ -1,0 +1,58 @@
+# MiniMax-H3-Image (T2I) LoRA. Read the "MiniMax-H3-Image" section of docs/supported_models.md first.
+# Weights: Comfy-Org/MiniMax-H3-Image (DiT + image VAE) and the MiniMax H3 text encoder (same as for H3 video).
+
+output_dir = '/data/diffusion_pipe_training_runs/minimax_h3_image'
+dataset = 'examples/minimax_h3_image_dataset.toml'
+
+epochs = 1000
+micro_batch_size_per_gpu = 4
+pipeline_stages = 1
+gradient_accumulation_steps = 1
+gradient_clipping = 1
+warmup_steps = 10
+
+eval_every_n_epochs = 1
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 1
+eval_gradient_accumulation_steps = 1
+
+save_every_n_epochs = 1
+checkpoint_every_n_epochs = 1
+activation_checkpointing = true  # 'unsloth' to offload activations to host RAM when VRAM is tight
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 1
+steps_per_print = 1
+# blocks_to_swap = 24  # max 48; only if the 33B DiT does not fit next to the activations
+compile = true
+
+[model]
+type = 'minimax_h3_image'
+diffusion_model = '/models/diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors'
+# the H3-Image VAE; the H3 video VAE (minimax_h3_video_vae_fp16.safetensors) has a bit-identical encoder and works too
+vae = '/models/vae/minimax_h3_image_vae_fp16.safetensors'
+text_encoders = [
+    {path = '/models/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors', type = 'minimax'}
+]
+dtype = 'bfloat16'
+# Timesteps are ALWAYS the checkpoint's 6 PDD grid sigmas (1.0 .968 .888 .75 .533 .232), each through its own head;
+# timestep_sample_method / shift / image_shift are ignored. Optional per-sigma sampling weights (default uniform):
+#pdd_step_weights = [2, 2, 1, 1, 1, 1]
+
+[adapter]
+type = 'lora'
+rank = 16
+dtype = 'bfloat16'
+
+# The model is step + guidance distilled; train on top of ostris' de-distillation adapter (frozen, NOT used at
+# inference). HF: ostris/minimax_h3_training_adapter / minimax_h3_image_training_adapter_v1.safetensors
+[[adapter.runtime_adapters]]
+path = '/models/loras/training_adapters/minimax_h3_image_training_adapter_v1.safetensors'
+weight = 1.0
+
+[optimizer]
+type = 'adamw_optimi'
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8
